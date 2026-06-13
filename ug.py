@@ -1,41 +1,96 @@
 """
-GreatUgandaJobs.com Scraper  (ug.py)
-Scrapes all jobs from greatugandajobs.com and saves to CSV / JSON.
-Full verbose output prints every scraped field to the terminal.
+GreatUgandaJobs.com Scraper + Paraphraser + WordPress Poster  (ug.py)
+======================================================================
+Scrapes all jobs from greatugandajobs.com, paraphrases titles /
+descriptions / company info via Mistral, then posts to WordPress
+(WP Job Manager plugin) with logo upload and taxonomy support.
 
 Usage:
-    python ug.py                      # scrape all pages → jobs.csv
+    python ug.py                      # scrape all pages → jobs.csv → WP
     python ug.py --pages 5            # limit to 5 listing pages
     python ug.py --output my_jobs     # custom output filename (no ext)
     python ug.py --json               # also save jobs.json
+    python ug.py --no-paraphrase      # skip Mistral paraphrasing
+    python ug.py --no-post            # skip WordPress posting (scrape only)
 
 Requirements:
-    pip install requests beautifulsoup4 lxml python-dateutil
+    pip install requests beautifulsoup4 lxml python-dateutil \
+                language-tool-python sentence-transformers pandas
 """
 
 import re
 import csv
 import json
 import time
+import base64
+import hashlib
 import logging
 import argparse
+import os
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from urllib.parse import unquote
 from typing import Optional
 
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 
+# Optional NLP deps — imported lazily so scrape-only mode works without them
+try:
+    import language_tool_python
+    from sentence_transformers import SentenceTransformer, util
+    NLP_AVAILABLE = True
+except ImportError:
+    NLP_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────
-#  CONFIG
+#  CONFIG  —  edit these before running
 # ─────────────────────────────────────────────────────────────
+
+# ── Scraper ───────────────────────────────────────────────────
 BASE_URL    = "https://www.greatugandajobs.com"
 LIST_PATH   = "/jobs/newest-jobs"
 PAGE_SIZE   = 20
 DELAY       = 1.5
 MAX_RETRIES = 3
 
+# ── Mistral ───────────────────────────────────────────────────
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "YOUR_MISTRAL_API_KEY_HERE")
+MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_MODEL   = "mistral-small-latest"
+
+# ── WordPress ─────────────────────────────────────────────────
+WP_SITE_URL   = os.getenv("WP_SITE_URL",   "https://yoursite.com")
+WP_USERNAME   = os.getenv("WP_USERNAME",   "your_wp_username")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "your_app_password")
+
+WP_BASE       = f"{WP_SITE_URL}/wp-json/wp/v2"
+WP_URL        = f"{WP_BASE}/job_listing"
+WP_MEDIA_URL  = f"{WP_BASE}/media"
+WP_COMPANY_URL = f"{WP_BASE}/company"          # adjust if CPT slug differs
+
+# ── Tracker file ─────────────────────────────────────────────
+PROCESSED_IDS_FILE = "processed_jobs.csv"
+
+# ── Job type normalisation map ────────────────────────────────
+JOB_TYPE_MAPPING = {
+    "full time":  "full-time",
+    "full-time":  "full-time",
+    "part time":  "part-time",
+    "part-time":  "part-time",
+    "contract":   "contract",
+    "contractor": "contract",
+    "internship": "internship",
+    "volunteer":  "volunteer",
+    "temporary":  "temporary",
+    "casual":     "casual",
+    "freelance":  "freelance",
+}
+
+# ─────────────────────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -53,6 +108,9 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# ─────────────────────────────────────────────────────────────
+#  COLUMN DEFINITIONS
+# ─────────────────────────────────────────────────────────────
 COLUMNS = [
     "job_title", "job_type", "qualifications", "experience",
     "location", "field", "date_posted", "deadline",
@@ -99,130 +157,129 @@ GENERIC_PATTERNS = [
 ]
 _GENERIC_RE = re.compile("|".join(GENERIC_PATTERNS), re.I)
 
-
 # ─────────────────────────────────────────────────────────────
-#  VERBOSE PRINTER
+#  NLP TOOLS  (grammar + similarity)
 # ─────────────────────────────────────────────────────────────
-
-def print_job(job: dict, index: int, total: int):
-    """Print every field of a scraped job in a readable box."""
-    width = 78
-    border = "═" * width
-
-    print(f"\n{'═' * width}")
-    print(f"  JOB {index} / {total}  ─  {job.get('job_url', '')}")
-    print(f"{'═' * width}")
-
-    for col in COLUMNS:
-        label = COLUMN_LABELS.get(col, col)
-        value = job.get(col, "") or ""
-
-        # Multiline fields: indent continuation lines
-        if col == "job_description":
-            print(f"\n  {'─' * (width - 2)}")
-            print(f"  {'JOB DESCRIPTION':^{width - 2}}")
-            print(f"  {'─' * (width - 2)}")
-            if value:
-                for line in value.split("\n"):
-                    # Wrap long lines at (width-4) chars
-                    while len(line) > width - 4:
-                        print(f"  {line[:width - 4]}")
-                        line = "  " + line[width - 4:]
-                    print(f"  {line}")
-            else:
-                print("  (no description)")
-            print(f"  {'─' * (width - 2)}\n")
-
-        elif col == "company_details":
-            print(f"\n  {'─' * (width - 2)}")
-            print(f"  {'COMPANY DETAILS':^{width - 2}}")
-            print(f"  {'─' * (width - 2)}")
-            if value:
-                for line in value.split("\n"):
-                    while len(line) > width - 4:
-                        print(f"  {line[:width - 4]}")
-                        line = "  " + line[width - 4:]
-                    print(f"  {line}")
-            else:
-                print("  (not available)")
-            print(f"  {'─' * (width - 2)}\n")
-
-        else:
-            display = str(value) if value else "(not found)"
-            # Wrap long single-line values
-            prefix = f"  {label:<22}: "
-            available = width - len(prefix)
-            if len(display) <= available:
-                print(f"{prefix}{display}")
-            else:
-                # First chunk
-                print(f"{prefix}{display[:available]}")
-                remaining = display[available:]
-                indent = " " * (len(prefix))
-                while remaining:
-                    print(f"{indent}{remaining[:available]}")
-                    remaining = remaining[available:]
-
-    print(f"{'═' * width}\n")
+_grammar_tool    = None
+_similarity_model = None
 
 
-# ─────────────────────────────────────────────────────────────
-#  HTTP HELPER
-# ─────────────────────────────────────────────────────────────
-session = requests.Session()
-session.headers.update(HEADERS)
-
-
-def fetch(url: str, retries: int = MAX_RETRIES) -> Optional[BeautifulSoup]:
-    for attempt in range(1, retries + 1):
+def _get_grammar_tool():
+    global _grammar_tool
+    if _grammar_tool is None and NLP_AVAILABLE:
         try:
-            r = session.get(url, timeout=20)
-            r.raise_for_status()
-            return BeautifulSoup(r.text, "lxml")
+            _grammar_tool = language_tool_python.LanguageTool(
+                "en-US", remote_server="https://api.languagetool.org"
+            )
         except Exception as e:
-            log.warning(f"Attempt {attempt}/{retries} failed for {url}: {e}")
-            if attempt < retries:
-                time.sleep(DELAY * attempt)
-    return None
+            log.warning(f"LanguageTool init failed: {e}")
+    return _grammar_tool
+
+
+def _get_similarity_model():
+    global _similarity_model
+    if _similarity_model is None and NLP_AVAILABLE:
+        try:
+            _similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        except Exception as e:
+            log.warning(f"SentenceTransformer init failed: {e}")
+    return _similarity_model
+
+
+def grammar_correct(text: str) -> str:
+    tool = _get_grammar_tool()
+    if not tool:
+        return text
+    try:
+        return language_tool_python.utils.correct(text, tool.check(text))
+    except Exception:
+        return text
+
+
+def similarity_score(a: str, b: str) -> float:
+    model = _get_similarity_model()
+    if not model:
+        return 0.75  # neutral fallback when model unavailable
+    try:
+        emb = model.encode([a, b], convert_to_tensor=True)
+        return float(util.pytorch_cos_sim(emb[0], emb[1]))
+    except Exception:
+        return 0.0
 
 
 # ─────────────────────────────────────────────────────────────
-#  CLEANING HELPERS
+#  MOJIBAKE / SANITISE HELPERS
 # ─────────────────────────────────────────────────────────────
+_MOJIBAKE = [
+    ("Â", ""), ("â€™", "\u2019"), ("â€œ", "\u201c"),
+    ("â€\x9d", "\u201d"), ("â€", "\u201d"),
+    ("â€\x93", "\u2013"), ("â€\x94", "\u2014"),
+    ("â€¢", "\u2022"), ("â„¢", "™"),
+    ("\u00a0", " "), ("\u200b", ""), ("\ufeff", ""),
+]
+
+
+def _fix_mojibake(text: str) -> str:
+    for pattern, replacement in _MOJIBAKE:
+        text = text.replace(pattern, replacement)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+    return text
+
+
+def sanitize_text(text, is_url=False, is_email=False) -> str:
+    if not isinstance(text, str):
+        text = str(text) if pd.notna(text) else ""
+    text = text.strip()
+    if text in ("nan", "None", "NaN", "", "N/A", "n/a", "NA", "na"):
+        return ""
+    text = _fix_mojibake(text)
+    if is_url or is_email:
+        return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
+    text = re.sub(r"#+\s*", "", text)
+    text = re.sub(r"\*\*", "", text)
+    text = re.sub(
+        r"[^\x20-\x7E\n\u00C0-\u017F\u2013\u2014\u2018-\u201D\u2022]", "", text
+    )
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 
 def clean_text(value: str) -> str:
     if not value:
         return ""
-    value = (
-        value.replace("Â", "")
-             .replace("â€™", "\u2019").replace("â€œ", "\u201c")
-             .replace("â€\x9d", "\u201d").replace("â€", "\u201d")
-             .replace("â€\x93", "\u2013").replace("â€\x94", "\u2014")
-             .replace("â€¢", "\u2022")
-    )
+    value = _fix_mojibake(value)
     value = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", value)
     value = re.sub(r"\s+", " ", value).strip()
     value = re.sub(r"^N/A$", "", value, flags=re.I)
     return value
 
 
+def clean_output(text: str) -> str:
+    text = _fix_mojibake(text)
+    for pat in [
+        r"\[/?INST\]", r"</?s>",
+        r"(?i)(rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
+        r"\*\*", r"###", r"---",
+    ]:
+        text = re.sub(pat, "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return grammar_correct(text.strip())
+
+
+# ─────────────────────────────────────────────────────────────
+#  FIELD CLEANERS
+# ─────────────────────────────────────────────────────────────
+
 def clean_job_type(raw: str) -> str:
     if not raw:
         return ""
     mapping = {
-        "FULL_TIME":   "Full Time",
-        "FULLTIME":    "Full Time",
-        "FULL-TIME":   "Full Time",
-        "PART_TIME":   "Part Time",
-        "PARTTIME":    "Part Time",
-        "PART-TIME":   "Part Time",
-        "CONTRACT":    "Contract",
-        "CONTRACTOR":  "Contract",
-        "INTERNSHIP":  "Internship",
-        "VOLUNTEER":   "Volunteer",
-        "TEMPORARY":   "Temporary",
-        "CASUAL":      "Casual",
-        "FREELANCE":   "Freelance",
+        "FULL_TIME": "Full Time", "FULLTIME": "Full Time", "FULL-TIME": "Full Time",
+        "PART_TIME": "Part Time", "PARTTIME": "Part Time", "PART-TIME": "Part Time",
+        "CONTRACT":  "Contract",  "CONTRACTOR": "Contract",
+        "INTERNSHIP": "Internship", "VOLUNTEER": "Volunteer",
+        "TEMPORARY": "Temporary", "CASUAL": "Casual", "FREELANCE": "Freelance",
     }
     key = raw.strip().upper().replace(" ", "_")
     return mapping.get(key, raw.strip().replace("_", " ").title())
@@ -310,6 +367,10 @@ def add_three_months(date_str: str) -> str:
         return (datetime.today() + relativedelta(months=3)).strftime("%d-%m-%Y")
 
 
+def normalise_job_type(raw: str) -> str:
+    return JOB_TYPE_MAPPING.get(raw.lower().strip(), "full-time")
+
+
 # ─────────────────────────────────────────────────────────────
 #  TITLE HELPERS
 # ─────────────────────────────────────────────────────────────
@@ -374,7 +435,7 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  DESCRIPTION EXTRACTOR  (complete, well-formatted)
+#  DESCRIPTION EXTRACTOR
 # ─────────────────────────────────────────────────────────────
 
 def extract_description(soup: BeautifulSoup) -> str:
@@ -422,7 +483,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     for child in container.children:
         walk(child)
 
-    # Collapse consecutive blank lines
     result, blank_count = [], 0
     for line in lines:
         if line == "":
@@ -434,6 +494,89 @@ def extract_description(soup: BeautifulSoup) -> str:
             result.append(line)
 
     return "\n".join(result).strip()
+
+
+# ─────────────────────────────────────────────────────────────
+#  VERBOSE PRINTER
+# ─────────────────────────────────────────────────────────────
+
+def print_job(job: dict, index: int, total: int):
+    width = 78
+    print(f"\n{'═' * width}")
+    print(f"  JOB {index} / {total}  ─  {job.get('job_url', '')}")
+    print(f"{'═' * width}")
+
+    for col in COLUMNS:
+        label = COLUMN_LABELS.get(col, col)
+        value = job.get(col, "") or ""
+
+        if col == "job_description":
+            print(f"\n  {'─' * (width - 2)}")
+            print(f"  {'JOB DESCRIPTION':^{width - 2}}")
+            print(f"  {'─' * (width - 2)}")
+            if value:
+                for line in value.split("\n"):
+                    while len(line) > width - 4:
+                        print(f"  {line[:width - 4]}")
+                        line = "  " + line[width - 4:]
+                    print(f"  {line}")
+            else:
+                print("  (no description)")
+            print(f"  {'─' * (width - 2)}\n")
+
+        elif col == "company_details":
+            print(f"\n  {'─' * (width - 2)}")
+            print(f"  {'COMPANY DETAILS':^{width - 2}}")
+            print(f"  {'─' * (width - 2)}")
+            if value:
+                for line in value.split("\n"):
+                    while len(line) > width - 4:
+                        print(f"  {line[:width - 4]}")
+                        line = "  " + line[width - 4:]
+                    print(f"  {line}")
+            else:
+                print("  (not available)")
+            print(f"  {'─' * (width - 2)}\n")
+
+        else:
+            display   = str(value) if value else "(not found)"
+            prefix    = f"  {label:<22}: "
+            available = width - len(prefix)
+            indent    = " " * len(prefix)
+            is_url    = display.startswith("http") or display.startswith("//")
+            if is_url:
+                print(f"{prefix}")
+                print(f"{indent}{display}")
+            elif len(display) <= available:
+                print(f"{prefix}{display}")
+            else:
+                print(f"{prefix}{display[:available]}")
+                remaining = display[available:]
+                while remaining:
+                    print(f"{indent}{remaining[:available]}")
+                    remaining = remaining[available:]
+
+    print(f"{'═' * width}\n")
+
+
+# ─────────────────────────────────────────────────────────────
+#  HTTP HELPER
+# ─────────────────────────────────────────────────────────────
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+def fetch(url: str, retries: int = MAX_RETRIES) -> Optional[BeautifulSoup]:
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, timeout=20)
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "lxml")
+        except Exception as e:
+            log.warning(f"Attempt {attempt}/{retries} failed for {url}: {e}")
+            if attempt < retries:
+                time.sleep(DELAY * attempt)
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -492,38 +635,27 @@ def scrape_job(url: str) -> Optional[dict]:
         el = soup.find(attrs={"itemprop": itemprop})
         return clean_text(el.get_text(" ", strip=True)) if el else ""
 
-    # Job Type
-    raw_type = sd("employmentType") or extract_info_field(soup, "Job Type")
-    job_type = clean_job_type(raw_type)
-
-    # Qualifications
-    qual_el = soup.find(attrs={"itemprop": "credentialCategory"})
+    raw_type   = sd("employmentType") or extract_info_field(soup, "Job Type")
+    job_type   = clean_job_type(raw_type)
+    qual_el    = soup.find(attrs={"itemprop": "credentialCategory"})
     qualifications = clean_text(qual_el.get_text(strip=True)) if qual_el else ""
-
-    # Experience
-    exp_el  = soup.find(attrs={"itemprop": "monthsOfExperience"})
-    raw_exp = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
+    exp_el     = soup.find(attrs={"itemprop": "monthsOfExperience"})
+    raw_exp    = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
     experience = clean_experience(raw_exp)
 
-    # Location
     raw_loc  = extract_info_field(soup, "Duty Station") or sd("addressLocality")
     location = clean_location(raw_loc)
-
-    # Field
     raw_field = extract_info_field(soup, "Job Category") or sd("occupationalCategory")
     field     = clean_field(raw_field)
 
-    # Dates
     raw_posted = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
                         sd("datePosted") or extract_info_field(soup, "Posted")).strip()
-    date_posted = clean_date_posted(raw_posted)
-
+    date_posted  = clean_date_posted(raw_posted)
     raw_deadline = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
                           sd("validThrough") or extract_info_field(soup, "Deadline of this Job")).strip()
     deadline     = clean_deadline(raw_deadline)
     est_deadline = add_three_months(date_posted) if date_posted else ""
 
-    # Salary
     sal_val  = soup.find("div", itemprop="value")
     sal_unit = soup.find("div", itemprop="unitText")
     salary   = ""
@@ -540,10 +672,8 @@ def scrape_job(url: str) -> Optional[dict]:
                 if val.lower() not in ("not disclosed", "n/a", ""):
                     salary = val
 
-    # Full description
     job_description = extract_description(soup)
 
-    # Application
     application = ""
     for a in soup.find_all("a", href=True):
         txt  = a.get_text(strip=True).lower()
@@ -565,7 +695,6 @@ def scrape_job(url: str) -> Optional[dict]:
                 application = clean_application(a["href"])
                 break
 
-    # Company
     comp_anchor      = soup.find("a", class_="js_job_company_anchor")
     company_name     = ""
     company_page_url = ""
@@ -579,16 +708,27 @@ def scrape_job(url: str) -> Optional[dict]:
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    logo_el      = soup.find("img", class_="js_jobs_company_logo")
-    company_logo = logo_el["src"] if logo_el else ""
-    if company_logo and not company_logo.startswith("http"):
-        company_logo = "https:" + company_logo
+    logo_el = soup.find("img", class_="js_jobs_company_logo")
+    company_logo = ""
+    if logo_el:
+        raw_src = (
+            logo_el.get("src") or
+            logo_el.get("data-src") or
+            logo_el.get("data-lazy-src") or ""
+        ).strip()
+        if raw_src.startswith("//"):
+            company_logo = "https:" + raw_src
+        elif raw_src.startswith("/"):
+            company_logo = BASE_URL + raw_src
+        elif raw_src.startswith("http"):
+            company_logo = raw_src
+        if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image")):
+            company_logo = ""
 
     website_el      = soup.find("div", itemprop="url")
     company_website = clean_text(website_el.get_text(strip=True)) if website_el else ""
     industry        = clean_text(sd("industry"))
 
-    # Company profile page
     company_extra = {}
     if company_page_url:
         log.info(f"    → Fetching company page: {company_page_url}")
@@ -657,7 +797,7 @@ def collect_job_urls(max_pages: Optional[int] = None) -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-#  SAVE
+#  SAVE CSV / JSON
 # ─────────────────────────────────────────────────────────────
 
 def save_csv(jobs: list, filename: str):
@@ -674,24 +814,577 @@ def save_json(jobs: list, filename: str):
     log.info(f"💾 Saved {len(jobs)} jobs → {filename}")
 
 
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  MISTRAL PARAPHRASING
+# ═══════════════════════════════════════════════════════════════
+
+def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
+    try:
+        response = requests.post(
+            MISTRAL_URL,
+            headers={
+                "Authorization": f"Bearer {MISTRAL_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       MISTRAL_MODEL,
+                "messages":    [{"role": "user", "content": prompt}],
+                "max_tokens":  max_tokens,
+                "temperature": temperature,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error(f"Mistral API error: {e}")
+        return ""
+
+
+def paraphrase_title(title: str) -> str:
+    clean = sanitize_text(title)
+    if not clean:
+        return title
+
+    print(f"\n ┌─ TITLE PARAPHRASE {'─'*45}")
+    print(f" │ Original : \"{clean}\"")
+    print(f" │ {'─'*60}")
+
+    best_result, best_sim = None, 0.0
+
+    for attempt in range(4):
+        temp = round(0.68 + attempt * 0.06, 2)
+        print(f" │ Attempt {attempt+1} (temp={temp}):")
+
+        prompt = (
+            f"Rewrite this job title professionally using different words. "
+            f"Output ONLY the rewritten title, nothing else. "
+            f"Keep it between 4 and 12 words.\n\nJob title: {clean}"
+        )
+        raw    = mistral_generate(prompt, max_tokens=50, temperature=temp)
+        result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
+
+        wc     = len(result.split()) if result else 0
+        sim    = similarity_score(clean, result) if result else 0.0
+        is_dup = result.lower().strip() == clean.lower().strip()
+
+        print(f" │    Output  : \"{result}\"")
+        print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes ⚠️' if is_dup else 'No'}")
+
+        valid = bool(result) and 4 <= wc <= 14 and sim >= 0.55 and not is_dup
+        if not valid:
+            reasons = []
+            if not result:  reasons.append("empty output")
+            if wc < 4:      reasons.append(f"too short ({wc} words, min=4)")
+            if wc > 14:     reasons.append(f"too long ({wc} words, max=14)")
+            if sim < 0.55:  reasons.append(f"sim={sim:.3f} < 0.55")
+            if is_dup:      reasons.append("identical to original")
+            print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
+        else:
+            if sim > best_sim:
+                best_sim, best_result = sim, result
+                print(f" │    → ✅ ACCEPTED — new best (sim={sim:.3f})")
+            else:
+                print(f" │    → ✅ VALID but not better (best sim={best_sim:.3f})")
+
+        print(f" │ {'─'*60}")
+        time.sleep(1)
+
+    if best_result:
+        print(f" │ 🏆 FINAL: \"{best_result}\" (sim={best_sim:.3f})")
+        print(f" └{'─'*65}")
+        return best_result
+    else:
+        print(f" │ ⚠️  No valid paraphrase → keeping original: \"{clean}\"")
+        print(f" └{'─'*65}")
+        return clean
+
+
+def paraphrase_description(text: str) -> str:
+    clean = sanitize_text(text)
+    if not clean:
+        return text
+
+    paragraphs    = [p.strip() for p in clean.split("\n") if p.strip()]
+    rewritten     = []
+    success_count = 0
+
+    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
+
+    for i, para in enumerate(paragraphs):
+        orig_wc = len(para.split())
+        print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
+        print(f" │ │ ORIGINAL ({orig_wc} words):")
+        orig_line = []
+        for w in para.split():
+            orig_line.append(w)
+            if len(" ".join(orig_line)) >= 100:
+                print(f" │ │    {' '.join(orig_line)}")
+                orig_line = []
+        if orig_line:
+            print(f" │ │    {' '.join(orig_line)}")
+        print(f" │ │ {'─'*60}")
+
+        prompt = (
+            f"Rewrite this job description paragraph professionally. "
+            f"Keep ALL facts, requirements, and responsibilities. "
+            f"Use different sentence structure and vocabulary. "
+            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
+            f"Original:\n{para}"
+        )
+
+        best_result, best_sim, accepted_text = None, 0.0, None
+
+        for attempt in range(3):
+            temp   = round(0.65 + attempt * 0.08, 2)
+            print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
+            raw    = mistral_generate(prompt, max_tokens=500, temperature=temp)
+            result = clean_output(raw).strip()
+            rw     = len(result.split()) if result else 0
+            sim    = similarity_score(para, result) if result and rw >= 5 else 0.0
+
+            if result:
+                print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
+                line = []
+                for w in result.split():
+                    line.append(w)
+                    if len(" ".join(line)) >= 100:
+                        print(f" │ │       {' '.join(line)}")
+                        line = []
+                if line:
+                    print(f" │ │       {' '.join(line)}")
+            else:
+                print(f" │ │    Paraphrased : (no output from model)")
+
+            valid = bool(result) and rw >= 8 and sim >= 0.48
+            if not valid:
+                reasons = []
+                if not result:  reasons.append("empty output")
+                if rw < 8:      reasons.append(f"too short ({rw} words, min=8)")
+                if sim < 0.48:  reasons.append(f"sim={sim:.3f} < 0.48")
+                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
+                if result and sim > best_sim:
+                    best_sim, best_result = sim, result
+                    print(f" │ │       (stored as best fallback, sim={sim:.3f})")
+            else:
+                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
+                rewritten.append(result)
+                success_count += 1
+                accepted_text = result
+                break
+            print(f" │ │ {'─'*60}")
+            time.sleep(1)
+
+        if accepted_text is None:
+            print(f" │ │ {'─'*60}")
+            if best_result and best_sim >= 0.40:
+                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f})")
+                rewritten.append(best_result)
+                success_count += 1
+            else:
+                print(f" │ │ ⚠️  KEPT ORIGINAL (best sim={best_sim:.3f}, threshold=0.40)")
+                rewritten.append(para)
+        print(f" │ └{'─'*62}")
+
+    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs paraphrased")
+    print(f" └{'─'*80}\n")
+    return "\n\n".join(rewritten)
+
+
+def paraphrase_company(text: str) -> str:
+    clean = sanitize_text(text)
+    if not clean:
+        return text
+
+    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
+    orig_wc = len(clean.split())
+    print(f" │ Original ({orig_wc} words):")
+    line = []
+    for w in clean.split():
+        line.append(w)
+        if len(" ".join(line)) >= 100:
+            print(f" │    {' '.join(line)}")
+            line = []
+    if line:
+        print(f" │    {' '.join(line)}")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company description professionally. "
+        f"Preserve all facts. Use different wording. "
+        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
+    )
+    raw    = mistral_generate(prompt, max_tokens=600, temperature=0.68)
+    result = clean_output(raw)
+    rw     = len(result.split()) if result else 0
+    sim    = similarity_score(clean, result) if result and rw >= 10 else 0.0
+
+    if result and rw >= 10:
+        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
+        line = []
+        for w in result.split():
+            line.append(w)
+            if len(" ".join(line)) >= 100:
+                print(f" │    {' '.join(line)}")
+                line = []
+        if line:
+            print(f" │    {' '.join(line)}")
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result:  reasons.append("empty output")
+        if rw < 10:     reasons.append(f"too short ({rw} words, min=10)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
+
+
+def paraphrase_tagline(text: str) -> str:
+    clean = sanitize_text(text[:300])
+    if not clean:
+        return text
+
+    print(f"\n ┌─ TAGLINE PARAPHRASE {'─'*43}")
+    print(f" │ Original : \"{clean}\"")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company tagline as a crisp, professional phrase. "
+        f"Output ONLY the rewritten tagline (5–12 words). No explanation.\n\n"
+        f"Original: {clean}"
+    )
+    raw    = mistral_generate(prompt, max_tokens=35, temperature=0.75)
+    result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
+    wc     = len(result.split()) if result else 0
+    sim    = similarity_score(clean, result) if result else 0.0
+
+    print(f" │ Paraphrased : \"{result}\"")
+    print(f" │ Words: {wc} | Similarity: {sim:.3f}")
+
+    if result and 3 <= wc <= 15:
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result:  reasons.append("empty output")
+        if wc < 3:      reasons.append(f"too short ({wc} words, min=3)")
+        if wc > 15:     reasons.append(f"too long ({wc} words, max=15)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DUPLICATE TRACKER
+# ═══════════════════════════════════════════════════════════════
+
+def _init_tracker():
+    if not os.path.exists(PROCESSED_IDS_FILE):
+        pd.DataFrame(columns=[
+            "Job ID", "Job URL", "Job Title", "Company Name",
+            "Status", "Timestamp", "Sheet Row",
+        ]).to_csv(PROCESSED_IDS_FILE, index=False)
+
+
+def load_processed_ids() -> tuple:
+    _init_tracker()
+    df = pd.read_csv(PROCESSED_IDS_FILE)
+    return (
+        set(df["Job ID"].fillna("").astype(str)),
+        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
+    )
+
+
+def _upsert_row(job_id: str, updates: dict):
+    _init_tracker()
+    df   = pd.read_csv(PROCESSED_IDS_FILE)
+    mask = df["Job ID"].astype(str) == str(job_id)
+    if mask.any():
+        for col, val in updates.items():
+            if col in df.columns:
+                df.loc[mask, col] = val
+        df.loc[mask, "Timestamp"] = datetime.now().isoformat()
+    else:
+        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
+        row.update(updates)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(PROCESSED_IDS_FILE, index=False)
+
+
+def make_job_id(job: dict, idx: int) -> str:
+    src = sanitize_text(str(job.get("job_url", "")), is_url=True)
+    if src:
+        return hashlib.md5(src.encode()).hexdigest()[:16]
+    seed = f"{job.get('job_title','')}{job.get('company_name','')}{idx}"
+    return hashlib.md5(seed.encode()).hexdigest()[:16]
+
+
+def mark_read(job_id, job_url, title, company, sheet_row):
+    _upsert_row(job_id, {
+        "Job URL": job_url, "Job Title": title,
+        "Company Name": company, "Status": "read", "Sheet Row": sheet_row,
+    })
+
+
+def mark_posted(job_id, wp_id, wp_url):
+    _upsert_row(job_id, {"Status": f"posted|wp_id={wp_id}|{wp_url}"})
+
+
+def mark_failed(job_id, reason):
+    _upsert_row(job_id, {"Status": f"failed|{reason}"})
+
+
+def print_tracker_summary():
+    if not os.path.exists(PROCESSED_IDS_FILE):
+        return
+    df     = pd.read_csv(PROCESSED_IDS_FILE)
+    print(f"\n{'═'*55}")
+    print(f" TRACKER SUMMARY ({len(df)} total records)")
+    print(f"{'═'*55}")
+    counts = df["Status"].str.split("|").str[0].value_counts()
+    icons  = {"read": "🔵", "paraphrased": "🟡", "posted": "✅", "failed": "❌"}
+    for status, count in counts.items():
+        print(f" {icons.get(status,'⚪')} {status:<15} {count}")
+    print(f"{'═'*55}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WORDPRESS HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def wp_headers() -> dict:
+    token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
+    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+
+
+def upload_logo(logo_url: str) -> Optional[int]:
+    logo_url = sanitize_text(logo_url, is_url=True)
+    if not logo_url or not logo_url.startswith("http"):
+        return None
+    ext = logo_url.lower().rsplit(".", 1)[-1]
+    if ext not in ("png", "jpg", "jpeg", "webp"):
+        return None
+    try:
+        img = requests.get(logo_url, timeout=10)
+        img.raise_for_status()
+        h = wp_headers()
+        h["Content-Disposition"] = f"attachment; filename={logo_url.split('/')[-1]}"
+        h["Content-Type"]        = img.headers.get("content-type", "image/jpeg")
+        r = requests.post(
+            WP_MEDIA_URL, headers=h, data=img.content,
+            auth=(WP_USERNAME, WP_APP_PASSWORD), timeout=15, verify=False,
+        )
+        r.raise_for_status()
+        return r.json().get("id")
+    except Exception as e:
+        log.error(f"Logo upload error: {e}")
+        return None
+
+
+def get_or_create_term(taxonomy_url: str, name: str) -> Optional[int]:
+    if not name or not name.strip():
+        return None
+    slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())
+    try:
+        r     = requests.get(f"{taxonomy_url}?slug={slug}", headers=wp_headers(), timeout=10, verify=False)
+        terms = r.json()
+        if isinstance(terms, list) and terms:
+            return terms[0]["id"]
+    except Exception:
+        pass
+    try:
+        r = requests.post(
+            taxonomy_url, json={"name": name, "slug": slug},
+            headers=wp_headers(), auth=(WP_USERNAME, WP_APP_PASSWORD),
+            timeout=10, verify=False,
+        )
+        return r.json().get("id")
+    except Exception as e:
+        log.error(f"Term create error '{name}': {e}")
+        return None
+
+
+def save_company(job: dict) -> tuple:
+    """Create or find a company CPT post in WordPress."""
+    name = sanitize_text(job.get("company_name", ""))
+    if not name or name in ("Unknown Company", "nan"):
+        return None, None
+    slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
+    try:
+        r     = requests.get(f"{WP_COMPANY_URL}?slug={slug}", headers=wp_headers(), timeout=10, verify=False)
+        posts = r.json()
+        if isinstance(posts, list) and posts:
+            log.info(f"⏭ Company exists: {name}")
+            return posts[0]["id"], posts[0].get("link")
+    except Exception:
+        pass
+
+    attachment_id = upload_logo(job.get("company_logo", ""))
+    raw           = job.get("company_details", "")
+    details       = paraphrase_company(raw) if raw else ""
+    tagline       = paraphrase_tagline(raw[:300]) if raw else ""
+
+    payload = {
+        "title":          name,
+        "content":        details,
+        "status":         "publish",
+        "featured_media": attachment_id or 0,
+        "meta": {
+            "_company_name":     name,
+            "_company_logo":     str(attachment_id) if attachment_id else "",
+            "_company_industry": sanitize_text(job.get("industry", "")),
+            "_company_website":  sanitize_text(job.get("website", ""), is_url=True),
+            "_company_tagline":  tagline,
+        },
+    }
+    try:
+        r = requests.post(
+            WP_COMPANY_URL, json=payload, headers=wp_headers(),
+            auth=(WP_USERNAME, WP_APP_PASSWORD), timeout=15, verify=False,
+        )
+        r.raise_for_status()
+        post = r.json()
+        log.info(f"✅ Company posted: {name} → ID {post.get('id')}")
+        return post.get("id"), post.get("link")
+    except Exception as e:
+        log.error(f"Company post error '{name}': {e}")
+        return None, None
+
+
+def post_job_to_wp(job: dict, title: str, description: str) -> tuple:
+    """Post a single job to WordPress WP Job Manager."""
+    h = wp_headers()
+
+    # Pre-seed common job types
+    for jt_label in ["Full Time", "Part Time", "Contract",
+                     "Temporary", "Freelance", "Internship", "Volunteer"]:
+        get_or_create_term(f"{WP_BASE}/job_listing_type", jt_label)
+
+    location    = sanitize_text(job.get("location", "Uganda"))
+    raw_type    = sanitize_text(job.get("job_type", "Full Time"))
+    job_type_s  = normalise_job_type(raw_type)
+    company     = sanitize_text(job.get("company_name", ""))
+    application = sanitize_text(job.get("application", ""), is_url=True)
+    deadline    = sanitize_text(job.get("deadline", ""))
+    logo_url    = sanitize_text(job.get("company_logo", ""), is_url=True)
+    co_website  = sanitize_text(job.get("website", ""), is_url=True)
+    qualif      = sanitize_text(job.get("qualifications", ""))
+    experience  = sanitize_text(job.get("experience", ""))
+    industry    = sanitize_text(job.get("industry", ""))
+    co_address  = sanitize_text(job.get("address", ""))
+    job_field   = sanitize_text(job.get("field", ""))
+    job_url     = sanitize_text(job.get("job_url", ""), is_url=True)
+    co_founded  = sanitize_text(job.get("founded", ""))
+    co_type     = sanitize_text(job.get("company_type", ""))
+    salary      = sanitize_text(job.get("salary_range", ""))
+    if not deadline:
+        deadline = sanitize_text(job.get("estimated_deadline", ""))
+
+    is_email = bool(re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", application))
+    is_url_v = bool(re.match(r"^https?://[^\s]+$", application))
+    if not (is_email or is_url_v):
+        application = ""
+
+    slug = re.sub(r"[^a-z0-9-]", "-", title.lower())[:80]
+    try:
+        r     = requests.get(f"{WP_URL}?slug={slug}", headers=h, timeout=10, verify=False)
+        posts = r.json()
+        if isinstance(posts, list) and posts:
+            log.info(f"⏭ Job already on WP: {title}")
+            return posts[0]["id"], posts[0].get("link")
+    except Exception:
+        pass
+
+    attachment_id    = upload_logo(logo_url)
+    region_term_id   = get_or_create_term(f"{WP_BASE}/job_listing_region", location)
+    job_type_term_id = get_or_create_term(
+        f"{WP_BASE}/job_listing_type", job_type_s.replace("-", " ").title()
+    )
+
+    payload = {
+        "title":          title,
+        "content":        description,
+        "status":         "publish",
+        "featured_media": attachment_id or 0,
+        "meta": {
+            "_job_title":          title,
+            "_job_location":       location,
+            "_job_type":           job_type_s,
+            "_job_description":    description,
+            "_application":        application,
+            "_job_expires":        deadline,
+            "_company_name":       company,
+            "_company_website":    co_website,
+            "_company_logo":       str(attachment_id) if attachment_id else "",
+            "_company_industry":   industry,
+            "_company_address":    co_address,
+            "_company_founded":    co_founded,
+            "_company_type":       co_type,
+            "_job_qualifications": qualif,
+            "_job_experiences":    experience,
+            "_job_field":          job_field,
+            "_job_source_url":     job_url,
+            "_job_salary":         salary,
+        },
+    }
+    if region_term_id:
+        payload["job_listing_region"] = [region_term_id]
+    if job_type_term_id:
+        payload["job_listing_type"] = [job_type_term_id]
+
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                WP_URL, json=payload, headers=h,
+                auth=(WP_USERNAME, WP_APP_PASSWORD), timeout=20, verify=False,
+            )
+            r.raise_for_status()
+            post = r.json()
+            log.info(f"✅ Job posted: '{title}' → WP ID {post.get('id')}")
+            return post.get("id"), post.get("link")
+        except Exception as e:
+            log.error(f"Job post attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════
 #  MAIN
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape GreatUgandaJobs.com — full verbose")
-    parser.add_argument("--pages",  type=int, default=None,
+    parser = argparse.ArgumentParser(
+        description="Scrape GreatUgandaJobs → Paraphrase → Post to WordPress"
+    )
+    parser.add_argument("--pages",        type=int, default=None,
                         help="Max listing pages (default: all)")
-    parser.add_argument("--output", default="jobs",
+    parser.add_argument("--output",       default="jobs",
                         help="Output filename without extension (default: jobs)")
-    parser.add_argument("--json",   action="store_true",
+    parser.add_argument("--json",         action="store_true",
                         help="Also save JSON output")
+    parser.add_argument("--no-paraphrase", action="store_true",
+                        help="Skip Mistral paraphrasing (post raw text)")
+    parser.add_argument("--no-post",      action="store_true",
+                        help="Skip WordPress posting (scrape + save only)")
     args = parser.parse_args()
 
     SEP = "═" * 78
     print(f"\n{SEP}")
-    print(f"{'  GreatUgandaJobs Scraper  (ug.py)':^78}")
+    print(f"{'  GreatUgandaJobs Scraper + Paraphraser + WP Poster':^78}")
     print(f"{SEP}\n")
+
+    if not args.no_post and MISTRAL_API_KEY == "YOUR_MISTRAL_API_KEY_HERE":
+        log.warning("⚠️  MISTRAL_API_KEY not set — paraphrasing will fail.")
+    if not args.no_post and WP_SITE_URL == "https://yoursite.com":
+        log.warning("⚠️  WP_SITE_URL not configured — WordPress posting will fail.")
 
     # ── Step 1: collect URLs ──────────────────────────────────
     job_urls = collect_job_urls(max_pages=args.pages)
@@ -700,40 +1393,86 @@ def main():
     print(f"  Total unique job URLs found: {total}")
     print(f"{'─' * 78}\n")
 
-    # ── Step 2: scrape & print each job ──────────────────────
+    # Load already-processed IDs to skip duplicates
+    processed_ids, processed_urls = load_processed_ids()
+
+    # ── Step 2: scrape, paraphrase, post ─────────────────────
     jobs   = []
     errors = 0
+    posted = 0
+    skipped_dup = 0
 
     for i, url in enumerate(job_urls, 1):
         log.info(f"[{i}/{total}] Scraping: {url}")
+
+        # Skip already-posted URLs
+        if url in processed_urls:
+            log.info(f"  ⏭ Already processed, skipping: {url}")
+            skipped_dup += 1
+            continue
+
         try:
             job = scrape_job(url)
-            if job:
-                jobs.append(job)
-                # ── FULL VERBOSE PRINT ──────────────────────
-                print_job(job, i, total)
-            else:
+            if not job:
                 print(f"\n  ⚠  [{i}/{total}] Skipped (no usable title): {url}\n")
+                continue
+
+            jobs.append(job)
+            print_job(job, i, total)
+
+            job_id = make_job_id(job, i)
+            mark_read(job_id, url, job["job_title"], job["company_name"], i)
+
+            if not args.no_post:
+                # ── Paraphrase ────────────────────────────────
+                if args.no_paraphrase:
+                    final_title = job["job_title"]
+                    final_desc  = job["job_description"]
+                else:
+                    log.info(f"  ✏  Paraphrasing title…")
+                    final_title = paraphrase_title(job["job_title"])
+                    log.info(f"  ✏  Paraphrasing description…")
+                    final_desc  = paraphrase_description(job["job_description"])
+
+                # ── Company ──────────────────────────────────
+                save_company(job)
+
+                # ── Post job ──────────────────────────────────
+                log.info(f"  🚀 Posting to WordPress: \"{final_title}\"")
+                wp_id, wp_link = post_job_to_wp(job, final_title, final_desc)
+                if wp_id:
+                    mark_posted(job_id, wp_id, wp_link or "")
+                    posted += 1
+                else:
+                    mark_failed(job_id, "wp_post_failed")
+                    errors += 1
+
         except Exception as e:
             errors += 1
             log.error(f"  ✗ ERROR [{i}/{total}]: {e}")
 
-    # ── Step 3: save ─────────────────────────────────────────
+        time.sleep(DELAY)
+
+    # ── Step 3: save CSV / JSON ───────────────────────────────
     csv_file = args.output + ".csv"
     save_csv(jobs, csv_file)
     if args.json:
         save_json(jobs, args.output + ".json")
 
     # ── Summary ───────────────────────────────────────────────
+    print_tracker_summary()
     print(f"\n{'═' * 78}")
     print(f"  SUMMARY")
     print(f"{'─' * 78}")
-    print(f"  Total URLs found   : {total}")
-    print(f"  Jobs scraped       : {len(jobs)}")
-    print(f"  Skipped / errors   : {errors}")
-    print(f"  Output file        : {csv_file}")
+    print(f"  Total URLs found     : {total}")
+    print(f"  Jobs scraped         : {len(jobs)}")
+    print(f"  Skipped (duplicates) : {skipped_dup}")
+    if not args.no_post:
+        print(f"  Posted to WordPress  : {posted}")
+    print(f"  Errors               : {errors}")
+    print(f"  CSV output           : {csv_file}")
     if args.json:
-        print(f"  JSON file          : {args.output}.json")
+        print(f"  JSON output          : {args.output}.json")
     print(f"{'═' * 78}\n")
 
 
