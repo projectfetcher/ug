@@ -1,0 +1,91 @@
+name:  Scraper
+
+on:
+  schedule:
+    # Runs every 2 hours  (UTC)
+    - cron: "0 */2 * * *"
+  workflow_dispatch:          # allow manual trigger from GitHub UI
+    inputs:
+      pages:
+        description: "Max listing pages to scrape (leave blank = all)"
+        required: false
+        default: ""
+      save_json:
+        description: "Also save JSON output? (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+      # safety cap — full scrape rarely exceeds 30 min
+
+    steps:
+      # ── 1. Checkout repo ──────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ───────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Build scraper arguments ────────────────────────────
+      - name: Build run arguments
+        id: args
+        run: |
+          ARGS=""
+
+          # --pages  (manual trigger or default)
+          PAGES="${{ github.event.inputs.pages }}"
+          if [ -n "$PAGES" ]; then
+            ARGS="$ARGS --pages $PAGES"
+          fi
+
+          # --json flag
+          JSON="${{ github.event.inputs.save_json }}"
+          if [ "$JSON" = "true" ]; then
+            ARGS="$ARGS --json"
+          fi
+
+          # timestamp-based output name so each run is unique
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M")
+          ARGS="$ARGS --output jobs_$TIMESTAMP"
+
+          echo "run_args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Run scraper ────────────────────────────────────────
+      - name: Run scraper
+        run: |
+          python ug.py ${{ steps.args.outputs.run_args }}
+
+      # ── 6. Upload CSV (+ JSON if requested) as artifact ───────
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-${{ steps.args.outputs.timestamp }}
+          path: |
+            jobs_*.csv
+            jobs_*.json
+          retention-days: 30
+
+      # ── 7. (Optional) Commit results back to repo ─────────────
+      # Uncomment the block below if you want the CSV committed to
+      # a  "results/"  folder in your repository automatically.
+      #
+      # - name: Commit results to repo
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     mkdir -p results
+      #     cp jobs_*.csv results/
+      #     git add results/
+      #     git diff --cached --quiet || git commit -m "chore: scrape results ${{ steps.args.outputs.timestamp }}"
+      #     git push
