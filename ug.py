@@ -1,15 +1,16 @@
 """
-GreatUgandaJobs.com Scraper
+GreatUgandaJobs.com Scraper  (ug.py)
 Scrapes all jobs from greatugandajobs.com and saves to CSV / JSON.
+Full verbose output prints every scraped field to the terminal.
 
 Usage:
-    python scraper.py                      # scrape all pages → jobs.csv
-    python scraper.py --pages 5            # limit to 5 listing pages
-    python scraper.py --output my_jobs     # custom output filename (no ext)
-    python scraper.py --json               # also save jobs.json
+    python ug.py                      # scrape all pages → jobs.csv
+    python ug.py --pages 5            # limit to 5 listing pages
+    python ug.py --output my_jobs     # custom output filename (no ext)
+    python ug.py --json               # also save jobs.json
 
 Requirements:
-    pip install requests beautifulsoup4 lxml
+    pip install requests beautifulsoup4 lxml python-dateutil
 """
 
 import re
@@ -18,20 +19,21 @@ import json
 import time
 import logging
 import argparse
-from datetime import datetime, date
+from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from urllib.parse import urlencode, urlparse, parse_qs, unquote
+from urllib.parse import unquote
 from typing import Optional
+
 import requests
 from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────────────────────
-BASE_URL   = "https://www.greatugandajobs.com"
-LIST_PATH  = "/jobs/newest-jobs"
-PAGE_SIZE  = 20          # jobs per listing page
-DELAY      = 1.5         # seconds between requests (be polite)
+BASE_URL    = "https://www.greatugandajobs.com"
+LIST_PATH   = "/jobs/newest-jobs"
+PAGE_SIZE   = 20
+DELAY       = 1.5
 MAX_RETRIES = 3
 
 logging.basicConfig(
@@ -39,7 +41,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("guj_scraper")
+log = logging.getLogger("ug_scraper")
 
 HEADERS = {
     "User-Agent": (
@@ -60,7 +62,31 @@ COLUMNS = [
     "job_url", "estimated_deadline", "salary_range",
 ]
 
-# Generic titles to skip (collection listings, not real jobs)
+COLUMN_LABELS = {
+    "job_title":          "Job Title",
+    "job_type":           "Job Type",
+    "qualifications":     "Qualifications",
+    "experience":         "Experience",
+    "location":           "Location",
+    "field":              "Field",
+    "date_posted":        "Date Posted",
+    "deadline":           "Deadline",
+    "job_description":    "Job Description",
+    "application":        "Application",
+    "company_url":        "Company URL",
+    "company_name":       "Company Name",
+    "company_logo":       "Company Logo",
+    "industry":           "Industry",
+    "founded":            "Founded",
+    "company_type":       "Company Type",
+    "website":            "Website",
+    "address":            "Address",
+    "company_details":    "Company Details",
+    "job_url":            "Job URL",
+    "estimated_deadline": "Estimated Deadline",
+    "salary_range":       "Salary Range",
+}
+
 GENERIC_PATTERNS = [
     r"^fresh jobs? at ",
     r"^latest (jobs?|recruitment|openings?) at ",
@@ -72,6 +98,72 @@ GENERIC_PATTERNS = [
     r"^new recruitment at ",
 ]
 _GENERIC_RE = re.compile("|".join(GENERIC_PATTERNS), re.I)
+
+
+# ─────────────────────────────────────────────────────────────
+#  VERBOSE PRINTER
+# ─────────────────────────────────────────────────────────────
+
+def print_job(job: dict, index: int, total: int):
+    """Print every field of a scraped job in a readable box."""
+    width = 78
+    border = "═" * width
+
+    print(f"\n{'═' * width}")
+    print(f"  JOB {index} / {total}  ─  {job.get('job_url', '')}")
+    print(f"{'═' * width}")
+
+    for col in COLUMNS:
+        label = COLUMN_LABELS.get(col, col)
+        value = job.get(col, "") or ""
+
+        # Multiline fields: indent continuation lines
+        if col == "job_description":
+            print(f"\n  {'─' * (width - 2)}")
+            print(f"  {'JOB DESCRIPTION':^{width - 2}}")
+            print(f"  {'─' * (width - 2)}")
+            if value:
+                for line in value.split("\n"):
+                    # Wrap long lines at (width-4) chars
+                    while len(line) > width - 4:
+                        print(f"  {line[:width - 4]}")
+                        line = "  " + line[width - 4:]
+                    print(f"  {line}")
+            else:
+                print("  (no description)")
+            print(f"  {'─' * (width - 2)}\n")
+
+        elif col == "company_details":
+            print(f"\n  {'─' * (width - 2)}")
+            print(f"  {'COMPANY DETAILS':^{width - 2}}")
+            print(f"  {'─' * (width - 2)}")
+            if value:
+                for line in value.split("\n"):
+                    while len(line) > width - 4:
+                        print(f"  {line[:width - 4]}")
+                        line = "  " + line[width - 4:]
+                    print(f"  {line}")
+            else:
+                print("  (not available)")
+            print(f"  {'─' * (width - 2)}\n")
+
+        else:
+            display = str(value) if value else "(not found)"
+            # Wrap long single-line values
+            prefix = f"  {label:<22}: "
+            available = width - len(prefix)
+            if len(display) <= available:
+                print(f"{prefix}{display}")
+            else:
+                # First chunk
+                print(f"{prefix}{display[:available]}")
+                remaining = display[available:]
+                indent = " " * (len(prefix))
+                while remaining:
+                    print(f"{indent}{remaining[:available]}")
+                    remaining = remaining[available:]
+
+    print(f"{'═' * width}\n")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -99,7 +191,6 @@ def fetch(url: str, retries: int = MAX_RETRIES) -> Optional[BeautifulSoup]:
 # ─────────────────────────────────────────────────────────────
 
 def clean_text(value: str) -> str:
-    """Strip mojibake, excess whitespace, N/A placeholders."""
     if not value:
         return ""
     value = (
@@ -116,68 +207,46 @@ def clean_text(value: str) -> str:
 
 
 def clean_job_type(raw: str) -> str:
-    """
-    FULL_TIME  → Full Time
-    PART_TIME  → Part Time
-    CONTRACTOR → Contractor
-    """
     if not raw:
         return ""
     mapping = {
-        "FULL_TIME": "Full Time",
-        "FULLTIME": "Full Time",
-        "FULL-TIME": "Full Time",
-        "PART_TIME": "Part Time",
-        "PARTTIME": "Part Time",
-        "PART-TIME": "Part Time",
-        "CONTRACT": "Contract",
-        "CONTRACTOR": "Contract",
-        "INTERNSHIP": "Internship",
-        "VOLUNTEER": "Volunteer",
-        "TEMPORARY": "Temporary",
-        "CASUAL": "Casual",
-        "FREELANCE": "Freelance",
+        "FULL_TIME":   "Full Time",
+        "FULLTIME":    "Full Time",
+        "FULL-TIME":   "Full Time",
+        "PART_TIME":   "Part Time",
+        "PARTTIME":    "Part Time",
+        "PART-TIME":   "Part Time",
+        "CONTRACT":    "Contract",
+        "CONTRACTOR":  "Contract",
+        "INTERNSHIP":  "Internship",
+        "VOLUNTEER":   "Volunteer",
+        "TEMPORARY":   "Temporary",
+        "CASUAL":      "Casual",
+        "FREELANCE":   "Freelance",
     }
     key = raw.strip().upper().replace(" ", "_")
-    if key in mapping:
-        return mapping[key]
-    # Title-case fallback
-    return raw.strip().replace("_", " ").title()
+    return mapping.get(key, raw.strip().replace("_", " ").title())
 
 
 def clean_experience(raw: str) -> str:
-    """
-    '96' or '96 months' → '8 years'
-    '5 years'           → '5 years'
-    '2-3 years'         → '2-3 years'
-    """
     if not raw:
         return ""
     raw = raw.strip()
-    # Already has "year" in it
     if re.search(r"\byears?\b", raw, re.I):
         return raw
-    # Pure number or "N months"
     m = re.match(r"^(\d+)\s*(?:months?)?$", raw, re.I)
     if m:
         months = int(m.group(1))
         years  = months / 12
         if years == int(years):
             return f"{int(years)} year{'s' if years != 1 else ''}"
-        else:
-            return f"{years:.1f} years"
+        return f"{years:.1f} years"
     return raw
 
 
 def clean_location(raw: str) -> str:
-    """
-    'Kampala | Kampala'   → 'Kampala'
-    'Kampala | Uganda'    → 'Kampala'
-    'Kampala\nKampala'    → 'Kampala'
-    """
     if not raw:
         return ""
-    # Split on pipe, comma, newline → take first unique meaningful part
     parts = re.split(r"[|\n,/]", raw)
     seen, result = set(), []
     for p in parts:
@@ -189,40 +258,25 @@ def clean_location(raw: str) -> str:
 
 
 def clean_field(raw: str) -> str:
-    """
-    'Administrative jobs in Uganda' → 'Administrative'
-    'Management,Sales & Retail'     → 'Management, Sales & Retail'
-    """
     if not raw:
         return ""
-    # Remove trailing "jobs in Uganda" / "jobs in Kenya" etc.
     raw = re.sub(r"\s*jobs?\s+in\s+\w+", "", raw, flags=re.I).strip()
-    # Normalize commas
     raw = re.sub(r",\s*", ", ", raw).strip(", ")
     return raw
 
 
 def clean_deadline(raw: str) -> str:
-    """
-    'Thursday, June 25 2026'       → '25-06-2026'
-    '2026-06-20T17:00:00+00:00'    → '20-06-2026'
-    '20-06-2026'                   → '20-06-2026'
-    '12-06-2026'                   → '12-06-2026'
-    """
     if not raw:
         return ""
     raw = raw.strip()
-    # ISO datetime
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    # Already DD-MM-YYYY
     if re.match(r"\d{2}-\d{2}-\d{4}", raw):
         return raw
-    # Human-readable: "Thursday, June 25 2026"
-    for fmt in ("%A, %B %d %Y", "%B %d %Y", "%d %B %Y"):
+    for fmt in ("%A %B %d %Y", "%B %d %Y", "%d %B %Y"):
         try:
-            dt = datetime.strptime(re.sub(r",", "", raw), fmt.replace(",", ""))
+            dt = datetime.strptime(re.sub(r",", "", raw), fmt)
             return dt.strftime("%d-%m-%Y")
         except ValueError:
             pass
@@ -230,55 +284,30 @@ def clean_deadline(raw: str) -> str:
 
 
 def clean_date_posted(raw: str) -> str:
-    """Same as deadline cleaning."""
     return clean_deadline(raw)
 
 
 def clean_application(raw: str) -> str:
-    """
-    Extract email from query-string application URLs:
-    /company-application-form?...form[application-email]=jobs@x.com&...
-    OR return raw URL / email as-is.
-    """
     if not raw:
         return ""
     raw = raw.strip()
-
-    # Internal application form URL → extract email
     if "application-email" in raw:
         m = re.search(r"application-email\]=([^&]+)", raw)
         if m:
             return unquote(m.group(1)).strip()
-
-    # Already an email
     if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", raw):
         return raw
-
-    # URL containing "apply" or external apply link — keep as-is
     return raw
 
 
-def clean_description(raw: str) -> str:
-    """Normalise whitespace in the full description text."""
-    if not raw:
-        return ""
-    # Collapse multiple blank lines to single
-    raw = re.sub(r"\n{3,}", "\n\n", raw)
-    raw = re.sub(r"[ \t]+", " ", raw)
-    return raw.strip()
-
-
 def add_three_months(date_str: str) -> str:
-    """Given a date string (any format), return date + 3 months as DD-MM-YYYY."""
     cleaned = clean_deadline(date_str)
     try:
-        dt = datetime.strptime(cleaned, "%d-%m-%Y")
+        dt  = datetime.strptime(cleaned, "%d-%m-%Y")
         new = dt + relativedelta(months=3)
         return new.strftime("%d-%m-%Y")
     except Exception:
-        # Fallback: today + 3 months
-        new = datetime.today() + relativedelta(months=3)
-        return new.strftime("%d-%m-%Y")
+        return (datetime.today() + relativedelta(months=3)).strftime("%d-%m-%Y")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -286,37 +315,27 @@ def add_three_months(date_str: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def extract_raw_title(soup: BeautifulSoup) -> str:
-    # 1. Structured data (most reliable)
     t = soup.find("div", itemprop="title")
     if t:
         val = t.get_text(strip=True)
         if val:
             return val
-
-    # 2. jsjobs page-title span
     span = soup.find("span", class_="jsjobs-main-page-title")
     if span:
         val = span.get_text(strip=True)
         if val:
             return val
-
-    # 3. Vacancy title in description body
     body = soup.find("div", class_="jsjobs_description_data")
     if body:
         m = re.search(r"Vacancy title:\s*\n?([^\n\[]+)", body.get_text())
         if m:
             return m.group(1).strip()
-
-    # 4. og:title
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return re.sub(r"\s*[\|\-–]\s*.*$", "", og["content"]).strip()
-
-    # 5. <title> tag
     t = soup.find("title")
     if t:
         return re.sub(r"\s*[\|\-–]\s*.*$", "", t.get_text()).strip()
-
     return ""
 
 
@@ -324,12 +343,8 @@ def clean_title(raw: str) -> Optional[str]:
     if not raw:
         return None
     title = raw.strip()
-
     if _GENERIC_RE.match(title):
-        log.debug(f"Skipping generic title: {title}")
         return None
-
-    # Strip " job at Company Name"
     m = re.match(r"^(.+?)\s+job\s+at\s+.+$", title, re.I)
     if m:
         title = m.group(1).strip()
@@ -337,7 +352,6 @@ def clean_title(raw: str) -> Optional[str]:
         m = re.match(r"^(.+?)\s+at\s+.+$", title, re.I)
         if m:
             title = m.group(1).strip()
-
     title = re.sub(r"[\s,\-–]+$", "", title).strip()
     if len(title) > 150:
         title = title[:147] + "…"
@@ -349,11 +363,6 @@ def clean_title(raw: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────
 
 def extract_info_field(soup: BeautifulSoup, label: str) -> str:
-    """
-    Find  <span class="js_job_data_title">Label:</span>
-           <span class="js_job_data_value">Value</span>
-    inside any  div.js_job_data_wrapper
-    """
     for wrapper in soup.find_all("div", class_="js_job_data_wrapper"):
         title_el = wrapper.find("span", class_="js_job_data_title")
         if not title_el:
@@ -365,19 +374,14 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  JOB DESCRIPTION EXTRACTOR  (complete, well-formatted)
+#  DESCRIPTION EXTRACTOR  (complete, well-formatted)
 # ─────────────────────────────────────────────────────────────
 
 def extract_description(soup: BeautifulSoup) -> str:
-    """
-    Pull the full job description preserving logical line breaks:
-    - headings get a blank line before/after
-    - list items get a bullet prefix
-    """
-    container = soup.find("div", class_="jsjobs_description_data")
-    if not container:
-        # Fallback: the itemprop description div
-        container = soup.find("div", itemprop="description")
+    container = (
+        soup.find("div", class_="jsjobs_description_data") or
+        soup.find("div", itemprop="description")
+    )
     if not container:
         return ""
 
@@ -385,45 +389,32 @@ def extract_description(soup: BeautifulSoup) -> str:
 
     def walk(el):
         tag = el.name if el.name else None
-
         if tag in ("script", "style", "noscript"):
             return
-
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             text = el.get_text(" ", strip=True)
             if text:
                 lines.append("")
                 lines.append(text.upper())
                 lines.append("")
-
         elif tag == "li":
             text = el.get_text(" ", strip=True)
             if text:
                 lines.append(f"  • {text}")
-
         elif tag == "p":
             text = el.get_text(" ", strip=True)
             if text:
                 lines.append(text)
                 lines.append("")
-
-        elif tag in ("br",):
+        elif tag == "br":
             lines.append("")
-
-        elif tag in ("ul", "ol"):
+        elif tag in ("ul", "ol", "div", "section", "article", "aside"):
             for child in el.children:
                 walk(child)
-
-        elif tag in ("div", "section", "article", "aside"):
-            for child in el.children:
-                walk(child)
-
         elif tag is None:
-            # NavigableString
             text = str(el).strip()
             if text:
                 lines.append(text)
-
         else:
             for child in el.children:
                 walk(child)
@@ -431,9 +422,8 @@ def extract_description(soup: BeautifulSoup) -> str:
     for child in container.children:
         walk(child)
 
-    # Collapse > 2 consecutive blank lines
-    result = []
-    blank_count = 0
+    # Collapse consecutive blank lines
+    result, blank_count = [], 0
     for line in lines:
         if line == "":
             blank_count += 1
@@ -451,11 +441,7 @@ def extract_description(soup: BeautifulSoup) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def scrape_company_page(url: str) -> dict:
-    """Fetch extra company details from the employer profile page."""
-    out = {
-        "company_details": "", "founded": "",
-        "company_type": "", "address": "",
-    }
+    out = {"company_details": "", "founded": "", "company_type": "", "address": ""}
     if not url:
         return out
     soup = fetch(url)
@@ -463,7 +449,6 @@ def scrape_company_page(url: str) -> dict:
         return out
     time.sleep(DELAY)
 
-    # Company about text
     about = (
         soup.find("div", class_="jsjobs-full-width-data") or
         soup.find("div", attrs={"itemprop": "description"})
@@ -471,7 +456,6 @@ def scrape_company_page(url: str) -> dict:
     if about:
         out["company_details"] = clean_text(about.get_text(" ", strip=True))
 
-    # Meta info rows: Founded, Type, Address
     for li in soup.find_all("li"):
         lbl_el = li.find("span", class_="comp-info-title")
         val_el = li.find("span", class_="comp-info-desc")
@@ -499,61 +483,54 @@ def scrape_job(url: str) -> Optional[dict]:
         return None
     time.sleep(DELAY)
 
-    # ── Title ──────────────────────────────────────────────────
     raw_title = extract_raw_title(soup)
     job_title = clean_title(raw_title)
     if not job_title:
-        log.debug(f"No usable title at {url}")
         return None
-    log.info(f"  Title: {job_title}")
 
-    # ── Structured data helpers ────────────────────────────────
     def sd(itemprop: str) -> str:
         el = soup.find(attrs={"itemprop": itemprop})
         return clean_text(el.get_text(" ", strip=True)) if el else ""
 
-    # ── Job type ───────────────────────────────────────────────
+    # Job Type
     raw_type = sd("employmentType") or extract_info_field(soup, "Job Type")
     job_type = clean_job_type(raw_type)
 
-    # ── Qualifications ─────────────────────────────────────────
+    # Qualifications
     qual_el = soup.find(attrs={"itemprop": "credentialCategory"})
     qualifications = clean_text(qual_el.get_text(strip=True)) if qual_el else ""
 
-    # ── Experience ─────────────────────────────────────────────
-    exp_el = soup.find(attrs={"itemprop": "monthsOfExperience"})
+    # Experience
+    exp_el  = soup.find(attrs={"itemprop": "monthsOfExperience"})
     raw_exp = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
     experience = clean_experience(raw_exp)
 
-    # ── Location ───────────────────────────────────────────────
-    raw_loc = extract_info_field(soup, "Duty Station") or sd("addressLocality")
+    # Location
+    raw_loc  = extract_info_field(soup, "Duty Station") or sd("addressLocality")
     location = clean_location(raw_loc)
 
-    # ── Field / Category ───────────────────────────────────────
+    # Field
     raw_field = extract_info_field(soup, "Job Category") or sd("occupationalCategory")
-    field = clean_field(raw_field)
+    field     = clean_field(raw_field)
 
-    # ── Dates ──────────────────────────────────────────────────
-    raw_posted = sd("datePosted") or extract_info_field(soup, "Posted")
-    # Strip time component
-    raw_posted = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "", raw_posted).strip()
+    # Dates
+    raw_posted = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
+                        sd("datePosted") or extract_info_field(soup, "Posted")).strip()
     date_posted = clean_date_posted(raw_posted)
 
-    raw_deadline = sd("validThrough") or extract_info_field(soup, "Deadline of this Job")
-    raw_deadline = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "", raw_deadline).strip()
-    deadline = clean_deadline(raw_deadline)
-
+    raw_deadline = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
+                          sd("validThrough") or extract_info_field(soup, "Deadline of this Job")).strip()
+    deadline     = clean_deadline(raw_deadline)
     est_deadline = add_three_months(date_posted) if date_posted else ""
 
-    # ── Salary ─────────────────────────────────────────────────
-    sal_val = soup.find("div", itemprop="value")
+    # Salary
+    sal_val  = soup.find("div", itemprop="value")
     sal_unit = soup.find("div", itemprop="unitText")
-    salary = ""
+    salary   = ""
     if sal_val and sal_val.get_text(strip=True):
         cur_el = soup.find("div", itemprop="currency")
-        cur = cur_el.get_text(strip=True) if cur_el else ""
+        cur    = cur_el.get_text(strip=True) if cur_el else ""
         salary = f"{cur} {sal_val.get_text(strip=True)} / {sal_unit.get_text(strip=True) if sal_unit else 'month'}".strip()
-    # Fallback: og:description
     if not salary:
         og = soup.find("meta", property="og:description")
         if og:
@@ -563,150 +540,124 @@ def scrape_job(url: str) -> Optional[dict]:
                 if val.lower() not in ("not disclosed", "n/a", ""):
                     salary = val
 
-    # ── Job description (complete) ─────────────────────────────
+    # Full description
     job_description = extract_description(soup)
 
-    # ── Application ────────────────────────────────────────────
-    # Priority: external "Apply Now" link → internal form email → any email in description
+    # Application
     application = ""
-
-    # Check jsjobs apply button area
     for a in soup.find_all("a", href=True):
-        txt = a.get_text(strip=True).lower()
+        txt  = a.get_text(strip=True).lower()
         href = a["href"]
         if "apply" in txt or "click here" in txt:
-            # Internal company form → extract email
             if "application-email" in href:
                 application = clean_application(href)
                 break
-            # External HTTP link
             if href.startswith("http") and BASE_URL not in href:
                 application = href
                 break
-
-    # Fallback: email anywhere in description
     if not application:
         m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", job_description)
         if m:
             application = m.group(0)
-
-    # Fallback: any form href on page with application-email param
     if not application:
         for a in soup.find_all("a", href=True):
             if "application-email" in a["href"]:
                 application = clean_application(a["href"])
                 break
 
-    # ── Company info ───────────────────────────────────────────
-    comp_anchor = soup.find("a", class_="js_job_company_anchor")
-    company_name = ""
+    # Company
+    comp_anchor      = soup.find("a", class_="js_job_company_anchor")
+    company_name     = ""
     company_page_url = ""
     if comp_anchor:
         company_name = clean_text(comp_anchor.get_text(strip=True))
         href = comp_anchor.get("href", "")
         if href:
             company_page_url = href if href.startswith("http") else BASE_URL + href
-
-    # Structured data fallback for name
     if not company_name:
         org_name = soup.find("div", itemprop="name")
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    logo_el = soup.find("img", class_="js_jobs_company_logo")
+    logo_el      = soup.find("img", class_="js_jobs_company_logo")
     company_logo = logo_el["src"] if logo_el else ""
     if company_logo and not company_logo.startswith("http"):
         company_logo = "https:" + company_logo
 
-    website_el = soup.find("div", itemprop="url")
+    website_el      = soup.find("div", itemprop="url")
     company_website = clean_text(website_el.get_text(strip=True)) if website_el else ""
+    industry        = clean_text(sd("industry"))
 
-    industry = clean_text(sd("industry"))
-
-    # ── Extra company details from profile page ────────────────
+    # Company profile page
     company_extra = {}
     if company_page_url:
-        log.info(f"  Fetching company page: {company_page_url}")
+        log.info(f"    → Fetching company page: {company_page_url}")
         company_extra = scrape_company_page(company_page_url)
 
     return {
-        "job_title":        job_title,
-        "job_type":         job_type,
-        "qualifications":   qualifications,
-        "experience":       experience,
-        "location":         location,
-        "field":            field,
-        "date_posted":      date_posted,
-        "deadline":         deadline,
-        "job_description":  job_description,
-        "application":      application,
-        "company_url":      company_page_url,
-        "company_name":     company_name,
-        "company_logo":     company_logo,
-        "industry":         industry,
-        "founded":          company_extra.get("founded", ""),
-        "company_type":     company_extra.get("company_type", ""),
-        "website":          company_website,
-        "address":          company_extra.get("address", ""),
-        "company_details":  company_extra.get("company_details", ""),
-        "job_url":          url,
+        "job_title":          job_title,
+        "job_type":           job_type,
+        "qualifications":     qualifications,
+        "experience":         experience,
+        "location":           location,
+        "field":              field,
+        "date_posted":        date_posted,
+        "deadline":           deadline,
+        "job_description":    job_description,
+        "application":        application,
+        "company_url":        company_page_url,
+        "company_name":       company_name,
+        "company_logo":       company_logo,
+        "industry":           industry,
+        "founded":            company_extra.get("founded", ""),
+        "company_type":       company_extra.get("company_type", ""),
+        "website":            company_website,
+        "address":            company_extra.get("address", ""),
+        "company_details":    company_extra.get("company_details", ""),
+        "job_url":            url,
         "estimated_deadline": est_deadline,
-        "salary_range":     salary,
+        "salary_range":       salary,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  LISTING PAGE SCRAPER  (collects job URLs)
+#  LISTING PAGE  —  collect job URLs
 # ─────────────────────────────────────────────────────────────
 
 def collect_job_urls(max_pages: Optional[int] = None) -> list:
-    """Iterate listing pages and collect unique job-detail URLs."""
-    seen = set()
-    urls = []
-    page = 0
-
+    seen, urls, page = set(), [], 0
     while True:
         if max_pages and page >= max_pages:
             break
-
         offset = page * PAGE_SIZE
-        url = BASE_URL + LIST_PATH + (f"?start={offset}" if offset else "")
-        log.info(f"Listing page {page + 1}: {url}")
-
+        url    = BASE_URL + LIST_PATH + (f"?start={offset}" if offset else "")
+        log.info(f"📄 Listing page {page + 1}: {url}")
         soup = fetch(url)
         if not soup:
             log.warning(f"Failed to fetch listing page {page + 1}, stopping.")
             break
-
-        found_this_page = 0
-
-        # Primary selectors for job links
+        found = 0
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "job-detail" not in href:
                 continue
             full = href if href.startswith("http") else BASE_URL + href
-            # Strip nav suffix (/nav-19 etc.)
             full = re.sub(r"/nav-\d+.*$", "", full)
             if full not in seen:
                 seen.add(full)
                 urls.append(full)
-                found_this_page += 1
-
-        log.info(f"  Found {found_this_page} new URLs (total so far: {len(urls)})")
-
-        if found_this_page == 0:
-            log.info("No new jobs on this page — reached end of listings.")
+                found += 1
+        log.info(f"   Found {found} new URLs  (total: {len(urls)})")
+        if found == 0:
+            log.info("   No new jobs — end of listings.")
             break
-
         page += 1
         time.sleep(DELAY)
-
     return urls
 
 
 # ─────────────────────────────────────────────────────────────
-#  SAVE RESULTS
+#  SAVE
 # ─────────────────────────────────────────────────────────────
 
 def save_csv(jobs: list, filename: str):
@@ -714,13 +665,13 @@ def save_csv(jobs: list, filename: str):
         writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(jobs)
-    log.info(f"Saved {len(jobs)} jobs → {filename}")
+    log.info(f"💾 Saved {len(jobs)} jobs → {filename}")
 
 
 def save_json(jobs: list, filename: str):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(jobs, f, ensure_ascii=False, indent=2)
-    log.info(f"Saved {len(jobs)} jobs → {filename}")
+    log.info(f"💾 Saved {len(jobs)} jobs → {filename}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -728,56 +679,62 @@ def save_json(jobs: list, filename: str):
 # ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape GreatUgandaJobs.com")
-    parser.add_argument("--pages", type=int, default=None,
-                        help="Max listing pages to scrape (default: all)")
+    parser = argparse.ArgumentParser(description="Scrape GreatUgandaJobs.com — full verbose")
+    parser.add_argument("--pages",  type=int, default=None,
+                        help="Max listing pages (default: all)")
     parser.add_argument("--output", default="jobs",
                         help="Output filename without extension (default: jobs)")
-    parser.add_argument("--json", action="store_true",
-                        help="Also save a JSON file")
+    parser.add_argument("--json",   action="store_true",
+                        help="Also save JSON output")
     args = parser.parse_args()
 
-    log.info("=" * 55)
-    log.info("  GreatUgandaJobs Scraper  starting…")
-    log.info("=" * 55)
+    SEP = "═" * 78
+    print(f"\n{SEP}")
+    print(f"{'  GreatUgandaJobs Scraper  (ug.py)':^78}")
+    print(f"{SEP}\n")
 
-    # Install dateutil if missing
-    try:
-        from dateutil.relativedelta import relativedelta
-    except ImportError:
-        import subprocess, sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "python-dateutil", "-q"])
-
-    # Step 1: collect URLs
+    # ── Step 1: collect URLs ──────────────────────────────────
     job_urls = collect_job_urls(max_pages=args.pages)
-    log.info(f"\nTotal unique job URLs collected: {len(job_urls)}\n")
+    total    = len(job_urls)
+    print(f"\n{'─' * 78}")
+    print(f"  Total unique job URLs found: {total}")
+    print(f"{'─' * 78}\n")
 
-    # Step 2: scrape each job
-    jobs = []
+    # ── Step 2: scrape & print each job ──────────────────────
+    jobs   = []
     errors = 0
+
     for i, url in enumerate(job_urls, 1):
-        log.info(f"[{i}/{len(job_urls)}] {url}")
+        log.info(f"[{i}/{total}] Scraping: {url}")
         try:
             job = scrape_job(url)
             if job:
                 jobs.append(job)
+                # ── FULL VERBOSE PRINT ──────────────────────
+                print_job(job, i, total)
             else:
-                log.info("  Skipped (no usable title)")
+                print(f"\n  ⚠  [{i}/{total}] Skipped (no usable title): {url}\n")
         except Exception as e:
             errors += 1
-            log.error(f"  ERROR: {e}")
+            log.error(f"  ✗ ERROR [{i}/{total}]: {e}")
 
-    # Step 3: save
-    csv_file  = args.output + ".csv"
-    json_file = args.output + ".json"
+    # ── Step 3: save ─────────────────────────────────────────
+    csv_file = args.output + ".csv"
     save_csv(jobs, csv_file)
     if args.json:
-        save_json(jobs, json_file)
+        save_json(jobs, args.output + ".json")
 
-    log.info("=" * 55)
-    log.info(f"  Done. Scraped: {len(jobs)} | Errors: {errors}")
-    log.info("=" * 55)
+    # ── Summary ───────────────────────────────────────────────
+    print(f"\n{'═' * 78}")
+    print(f"  SUMMARY")
+    print(f"{'─' * 78}")
+    print(f"  Total URLs found   : {total}")
+    print(f"  Jobs scraped       : {len(jobs)}")
+    print(f"  Skipped / errors   : {errors}")
+    print(f"  Output file        : {csv_file}")
+    if args.json:
+        print(f"  JSON file          : {args.output}.json")
+    print(f"{'═' * 78}\n")
 
 
 if __name__ == "__main__":
