@@ -1,23 +1,3 @@
-"""
-GreatUgandaJobs.com Scraper + Paraphraser + WordPress Poster  (ug.py)
-======================================================================
-Scrapes all jobs from greatugandajobs.com, paraphrases titles /
-descriptions / company info via Mistral, then posts to WordPress
-(WP Job Manager plugin) with logo upload and taxonomy support.
-
-Usage:
-    python ug.py                      # scrape all pages → jobs.csv → WP
-    python ug.py --pages 5            # limit to 5 listing pages
-    python ug.py --output my_jobs     # custom output filename (no ext)
-    python ug.py --json               # also save jobs.json
-    python ug.py --no-paraphrase      # skip Mistral paraphrasing
-    python ug.py --no-post            # skip WordPress posting (scrape only)
-
-Requirements:
-    pip install requests beautifulsoup4 lxml python-dateutil \
-                language-tool-python sentence-transformers pandas
-"""
-
 import re
 import csv
 import json
@@ -49,7 +29,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────
 
 # ── Scraper ───────────────────────────────────────────────────
-BASE_URL    = "https://www.greatugandajobs.com"
+BASE_URL    = os.getenv("UG_BASE_URL", "")
 LIST_PATH   = "/jobs/newest-jobs"
 PAGE_SIZE   = 20
 DELAY       = 1.5
@@ -66,9 +46,9 @@ WP_USERNAME   = os.getenv("WP_USERNAME",   "")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 
 WP_BASE       = f"{WP_SITE_URL}/wp-json/wp/v2"
-WP_URL        = f"{WP_BASE}/job_listing"
+WP_URL        = f"{WP_BASE}/job-listings"
 WP_MEDIA_URL  = f"{WP_BASE}/media"
-WP_COMPANY_URL = f"{WP_BASE}/company"          # adjust if CPT slug differs
+WP_COMPANY_URL = f"{WP_BASE}/companies"          # adjust if CPT slug differs
 
 # ── Tracker file ─────────────────────────────────────────────
 PROCESSED_IDS_FILE = "processed_jobs.csv"
