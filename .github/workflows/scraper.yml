@@ -21,7 +21,7 @@ jobs:
           MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
           WP_USERNAME:      ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
-          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
+          WP_SITE_URL:      ${{ secrets.WP_SITE_URL }}
         run: python ug.py
       - name: Upload Excel output as artifact
         if: always()
