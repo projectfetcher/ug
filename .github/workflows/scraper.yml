@@ -22,6 +22,7 @@ jobs:
           WP_USERNAME:      ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
           WP_SITE_URL:      ${{ secrets.WP_SITE_URL }}
+          UG_BASE_URL:      ${{ secrets.UG_BASE_URL }}
         run: python ug.py
       - name: Upload Excel output as artifact
         if: always()
