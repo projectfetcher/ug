@@ -9,7 +9,7 @@ import argparse
 import os
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from urllib.parse import unquote, quote
+from urllib.parse import unquote
 from typing import Optional
 
 import requests
@@ -41,14 +41,14 @@ MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_MODEL   = "mistral-small-latest"
 
 # ── WordPress ─────────────────────────────────────────────────
-WP_SITE_URL     = os.getenv("WP_SITE_URL",     "")
-WP_USERNAME     = os.getenv("WP_USERNAME",     "")
+WP_SITE_URL   = os.getenv("WP_SITE_URL",   "")
+WP_USERNAME   = os.getenv("WP_USERNAME",   "")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 
-WP_BASE        = f"{WP_SITE_URL}/wp-json/wp/v2"
-WP_URL         = f"{WP_BASE}/job-listings"
-WP_MEDIA_URL   = f"{WP_BASE}/media"
-WP_COMPANY_URL = f"{WP_BASE}/companies"   # adjust if CPT slug differs
+WP_BASE       = f"{WP_SITE_URL}/wp-json/wp/v2"
+WP_URL        = f"{WP_BASE}/job-listings"
+WP_MEDIA_URL  = f"{WP_BASE}/media"
+WP_COMPANY_URL = f"{WP_BASE}/companies"          # adjust if CPT slug differs
 
 # ── Tracker file ─────────────────────────────────────────────
 PROCESSED_IDS_FILE = "processed_jobs.csv"
@@ -137,25 +137,10 @@ GENERIC_PATTERNS = [
 ]
 _GENERIC_RE = re.compile("|".join(GENERIC_PATTERNS), re.I)
 
-# Lines that are purely metadata / schema.org junk inside description containers
-_META_LINE_RE = re.compile(
-    r"^("
-    r"https?://\S+"                           # any URL
-    r"|//\S+"                                 # protocol-relative URL
-    r"|20\d{2}-\d{2}-\d{2}[T\s]\d{2}:\d{2}" # ISO datetime
-    r"|FULL_TIME|PART_TIME|CONTRACT(OR)?|INTERNSHIP|VOLUNTEER|TEMPORARY|CASUAL|FREELANCE"
-    r"|UGX|USD|KES|GHS|SAR|EUR|GBP"          # currency codes
-    r"|MONTH|YEAR|HOUR|WEEK|DAY"             # pay periods
-    r"|\d{5}"                                 # postal codes
-    r"|\s*\d{1,3}\s*$"                        # bare numbers (work hours, exp months)
-    r")",
-    re.I,
-)
-
 # ─────────────────────────────────────────────────────────────
 #  NLP TOOLS  (grammar + similarity)
 # ─────────────────────────────────────────────────────────────
-_grammar_tool     = None
+_grammar_tool    = None
 _similarity_model = None
 
 
@@ -263,29 +248,6 @@ def clean_output(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  LOGO URL HELPER
-# ─────────────────────────────────────────────────────────────
-
-def normalize_logo_url(raw: str) -> str:
-    """
-    Ensure a logo URL is properly encoded so requests.get() won't choke
-    on spaces or other unencoded characters in CDN filenames.
-    e.g. .../Premier%20Credit%20Limited.png  or  .../Premier Credit Limited.png
-    Both are normalised to a clean percent-encoded URL.
-    """
-    if not raw:
-        return ""
-    raw = raw.strip()
-    # Split off query string to avoid double-encoding it
-    parts = raw.split("?", 1)
-    path  = parts[0]
-    qs    = ("?" + parts[1]) if len(parts) > 1 else ""
-    # Decode then re-encode — this handles both already-encoded and bare-space URLs
-    path = quote(unquote(path), safe="/:@!$&'()*+,;=-._%~#[]")
-    return path + qs
-
-
-# ─────────────────────────────────────────────────────────────
 #  FIELD CLEANERS
 # ─────────────────────────────────────────────────────────────
 
@@ -293,11 +255,11 @@ def clean_job_type(raw: str) -> str:
     if not raw:
         return ""
     mapping = {
-        "FULL_TIME":  "Full Time", "FULLTIME":  "Full Time", "FULL-TIME":  "Full Time",
-        "PART_TIME":  "Part Time", "PARTTIME":  "Part Time", "PART-TIME":  "Part Time",
-        "CONTRACT":   "Contract",  "CONTRACTOR": "Contract",
-        "INTERNSHIP": "Internship", "VOLUNTEER":  "Volunteer",
-        "TEMPORARY":  "Temporary",  "CASUAL":     "Casual",   "FREELANCE":  "Freelance",
+        "FULL_TIME": "Full Time", "FULLTIME": "Full Time", "FULL-TIME": "Full Time",
+        "PART_TIME": "Part Time", "PARTTIME": "Part Time", "PART-TIME": "Part Time",
+        "CONTRACT":  "Contract",  "CONTRACTOR": "Contract",
+        "INTERNSHIP": "Internship", "VOLUNTEER": "Volunteer",
+        "TEMPORARY": "Temporary", "CASUAL": "Casual", "FREELANCE": "Freelance",
     }
     key = raw.strip().upper().replace(" ", "_")
     return mapping.get(key, raw.strip().replace("_", " ").title())
@@ -453,96 +415,8 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  DESCRIPTION EXTRACTOR  (with metadata cleanup)
+#  DESCRIPTION EXTRACTOR
 # ─────────────────────────────────────────────────────────────
-
-# Tags/attributes that carry schema.org structured data — not human-readable prose
-_SCHEMA_IPROPS = {
-    "employmentType", "credentialCategory", "monthsOfExperience",
-    "addressLocality", "addressRegion", "addressCountry", "postalCode",
-    "datePosted", "validThrough", "industry", "occupationalCategory",
-    "value", "unitText", "currency", "url", "name",
-    "streetAddress", "jobLocation", "baseSalary", "hiringOrganization",
-}
-
-# Known junk CSS classes injected into description containers
-_JUNK_CLASSES = {
-    "js_job_data_wrapper", "js_job_data_title", "js_job_data_value",
-    "jsjobs-full-width-data", "js_job_company_anchor",
-    "jsjobs_similar_jobs", "jsjobs_quick_alert",
-}
-
-
-def _strip_description_noise(container: BeautifulSoup) -> None:
-    """
-    Mutate the container in-place: remove all schema.org metadata nodes,
-    company logo images, sidebar widgets, and similar-jobs blocks that
-    bleed into the description container on this site.
-    """
-    # 1. Remove itemprop nodes (schema.org structured data)
-    for tag in container.find_all(True, itemprop=True):
-        prop = tag.get("itemprop", "")
-        if prop in _SCHEMA_IPROPS:
-            tag.decompose()
-
-    # 2. Remove all <img> tags (logos etc.)
-    for img in container.find_all("img"):
-        img.decompose()
-
-    # 3. Remove known junk CSS classes
-    for cls in _JUNK_CLASSES:
-        for tag in container.find_all(class_=cls):
-            tag.decompose()
-
-    # 4. Remove inline script / style / noscript
-    for tag in container.find_all(["script", "style", "noscript"]):
-        tag.decompose()
-
-    # 5. Remove "Similar Jobs in Uganda" and everything after it
-    #    (these appear as plain text or anchor blocks at the bottom)
-    for tag in container.find_all(string=re.compile(r"similar jobs in", re.I)):
-        parent = tag.parent
-        # Remove all following siblings too
-        for sib in list(parent.find_next_siblings()):
-            sib.decompose()
-        parent.decompose()
-
-    # 6. Remove anchor tags that are just internal navigation links
-    for a in container.find_all("a", href=True):
-        href = a.get("href", "")
-        text = a.get_text(strip=True)
-        # Bare navigation links with no real content
-        if text.lower() in ("all jobs", "quick alert subscription", "") or \
-                re.search(r"(quick.alert|all.jobs|subscription)", href, re.I):
-            a.decompose()
-
-
-def _is_meta_line(line: str) -> bool:
-    """Return True if a text line looks like schema/metadata junk, not prose."""
-    s = line.strip()
-    if not s:
-        return False
-    # Pure URL
-    if re.match(r"^https?://\S+$", s) or re.match(r"^//\S+$", s):
-        return True
-    # ISO timestamp
-    if re.match(r"^20\d{2}-\d{2}-\d{2}[T\s]", s):
-        return True
-    # Known enum tokens
-    if re.match(
-        r"^(FULL_TIME|PART_TIME|CONTRACT(OR)?|INTERNSHIP|VOLUNTEER|"
-        r"TEMPORARY|CASUAL|FREELANCE|UGX|USD|KES|GHS|SAR|EUR|GBP|"
-        r"MONTH|YEAR|HOUR|WEEK|DAY)$", s, re.I
-    ):
-        return True
-    # Standalone 5-digit postal code
-    if re.match(r"^\d{5}$", s):
-        return True
-    # Bare small number (work hours / experience months leaked as text)
-    if re.match(r"^\d{1,3}$", s):
-        return True
-    return False
-
 
 def extract_description(soup: BeautifulSoup) -> str:
     container = (
@@ -551,10 +425,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     )
     if not container:
         return ""
-
-    # Mutate in place — soup is already a fresh parse per job call,
-    # and scrape_job() extracts all other fields before calling this.
-    _strip_description_noise(container)
 
     lines = []
 
@@ -593,7 +463,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     for child in container.children:
         walk(child)
 
-    # ── Post-walk: strip metadata lines and collapse blanks ──
     result, blank_count = [], 0
     for line in lines:
         if line == "":
@@ -602,44 +471,9 @@ def extract_description(soup: BeautifulSoup) -> str:
                 result.append("")
         else:
             blank_count = 0
-            # Drop lines that are pure metadata/schema junk
-            if _is_meta_line(line):
-                continue
             result.append(line)
 
-    # ── Final: drop a leading "Vacancy title: …" summary block if present ──
-    #    These appear when the site injects a structured summary at the top
-    #    of the description container (e.g. "Vacancy title:Regional Sales Manager...")
-    text = "\n".join(result).strip()
-    # Remove the trailing "Vacancy title / Work Hours / Experience / Level of Education" block
-    text = re.sub(
-        r"\n*Vacancy title\s*:.*",
-        "",
-        text,
-        flags=re.S | re.I,
-    ).strip()
-    # Remove stray "Work Hours: 8", "Experience in Months: 24", "Level of Education: ..." lines
-    text = re.sub(
-        r"\n?(Work Hours|Experience in Months|Level of Education|Job application procedure"
-        r"|All Jobs|QUICK ALERT SUBSCRIPTION)\s*:?[^\n]*",
-        "",
-        text,
-        flags=re.I,
-    ).strip()
-    # Remove lines that are just a bare URL left over
-    lines2 = [l for l in text.split("\n") if not _is_meta_line(l)]
-    # Collapse triple+ blank lines again after removals
-    final, bc = [], 0
-    for l in lines2:
-        if l.strip() == "":
-            bc += 1
-            if bc <= 1:
-                final.append("")
-        else:
-            bc = 0
-            final.append(l)
-
-    return "\n".join(final).strip()
+    return "\n".join(result).strip()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -777,34 +611,28 @@ def scrape_job(url: str) -> Optional[dict]:
     if not job_title:
         return None
 
-    # sd() helper — reads itemprop nodes from the ORIGINAL soup.
-    # Must be used BEFORE extract_description(), which mutates the soup.
     def sd(itemprop: str) -> str:
         el = soup.find(attrs={"itemprop": itemprop})
         return clean_text(el.get_text(" ", strip=True)) if el else ""
 
-    raw_type       = sd("employmentType") or extract_info_field(soup, "Job Type")
-    job_type       = clean_job_type(raw_type)
-    qual_el        = soup.find(attrs={"itemprop": "credentialCategory"})
+    raw_type   = sd("employmentType") or extract_info_field(soup, "Job Type")
+    job_type   = clean_job_type(raw_type)
+    qual_el    = soup.find(attrs={"itemprop": "credentialCategory"})
     qualifications = clean_text(qual_el.get_text(strip=True)) if qual_el else ""
-    exp_el         = soup.find(attrs={"itemprop": "monthsOfExperience"})
-    raw_exp        = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
-    experience     = clean_experience(raw_exp)
+    exp_el     = soup.find(attrs={"itemprop": "monthsOfExperience"})
+    raw_exp    = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
+    experience = clean_experience(raw_exp)
 
-    raw_loc   = extract_info_field(soup, "Duty Station") or sd("addressLocality")
-    location  = clean_location(raw_loc)
+    raw_loc  = extract_info_field(soup, "Duty Station") or sd("addressLocality")
+    location = clean_location(raw_loc)
     raw_field = extract_info_field(soup, "Job Category") or sd("occupationalCategory")
     field     = clean_field(raw_field)
 
-    raw_posted = re.sub(
-        r"T\d{2}:\d{2}:\d{2}.*", "",
-        sd("datePosted") or extract_info_field(soup, "Posted"),
-    ).strip()
+    raw_posted = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
+                        sd("datePosted") or extract_info_field(soup, "Posted")).strip()
     date_posted  = clean_date_posted(raw_posted)
-    raw_deadline = re.sub(
-        r"T\d{2}:\d{2}:\d{2}.*", "",
-        sd("validThrough") or extract_info_field(soup, "Deadline of this Job"),
-    ).strip()
+    raw_deadline = re.sub(r"T\d{2}:\d{2}:\d{2}.*", "",
+                          sd("validThrough") or extract_info_field(soup, "Deadline of this Job")).strip()
     deadline     = clean_deadline(raw_deadline)
     est_deadline = add_three_months(date_posted) if date_posted else ""
 
@@ -814,10 +642,7 @@ def scrape_job(url: str) -> Optional[dict]:
     if sal_val and sal_val.get_text(strip=True):
         cur_el = soup.find("div", itemprop="currency")
         cur    = cur_el.get_text(strip=True) if cur_el else ""
-        salary = (
-            f"{cur} {sal_val.get_text(strip=True)} / "
-            f"{sal_unit.get_text(strip=True) if sal_unit else 'month'}"
-        ).strip()
+        salary = f"{cur} {sal_val.get_text(strip=True)} / {sal_unit.get_text(strip=True) if sal_unit else 'month'}".strip()
     if not salary:
         og = soup.find("meta", property="og:description")
         if og:
@@ -827,7 +652,8 @@ def scrape_job(url: str) -> Optional[dict]:
                 if val.lower() not in ("not disclosed", "n/a", ""):
                     salary = val
 
-    # ── Application link / email (read BEFORE description mutates soup) ──
+    job_description = extract_description(soup)
+
     application = ""
     for a in soup.find_all("a", href=True):
         txt  = a.get_text(strip=True).lower()
@@ -840,12 +666,15 @@ def scrape_job(url: str) -> Optional[dict]:
                 application = href
                 break
     if not application:
+        m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", job_description)
+        if m:
+            application = m.group(0)
+    if not application:
         for a in soup.find_all("a", href=True):
             if "application-email" in a["href"]:
                 application = clean_application(a["href"])
                 break
 
-    # ── Company info (read BEFORE description mutates soup) ──────────────
     comp_anchor      = soup.find("a", class_="js_job_company_anchor")
     company_name     = ""
     company_page_url = ""
@@ -859,38 +688,26 @@ def scrape_job(url: str) -> Optional[dict]:
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    # ── Logo (read BEFORE description mutates soup) ───────────────────────
-    logo_el      = soup.find("img", class_="js_jobs_company_logo")
+    logo_el = soup.find("img", class_="js_jobs_company_logo")
     company_logo = ""
     if logo_el:
-        raw_src = (
+        raw_src = re.sub(r"\s+", "", (
             logo_el.get("src") or
             logo_el.get("data-src") or
-            logo_el.get("data-lazy-src") or
-            ""
-        ).strip()
+            logo_el.get("data-lazy-src") or ""
+        ))
         if raw_src.startswith("//"):
-            raw_src = "https:" + raw_src
+            company_logo = "https:" + raw_src
         elif raw_src.startswith("/"):
-            raw_src = BASE_URL + raw_src
-        company_logo = normalize_logo_url(raw_src)
-        if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image", "defaultlogo")):
+            company_logo = BASE_URL + raw_src
+        elif raw_src.startswith("http"):
+            company_logo = raw_src
+        if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image")):
             company_logo = ""
 
     website_el      = soup.find("div", itemprop="url")
     company_website = clean_text(website_el.get_text(strip=True)) if website_el else ""
     industry        = clean_text(sd("industry"))
-
-    # ── Description — called LAST because it mutates the soup ─────────────
-    job_description = extract_description(soup)
-
-    # Fall back to scanning description text for email if not found above
-    if not application:
-        m = re.search(
-            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", job_description
-        )
-        if m:
-            application = m.group(0)
 
     company_extra = {}
     if company_page_url:
@@ -1328,21 +1145,17 @@ def wp_headers() -> dict:
 
 
 def upload_logo(logo_url: str) -> Optional[int]:
-    # Normalize and validate the URL before attempting download
-    logo_url = normalize_logo_url(sanitize_text(logo_url, is_url=True))
+    logo_url = sanitize_text(logo_url, is_url=True)
     if not logo_url or not logo_url.startswith("http"):
         return None
-    ext = logo_url.lower().rsplit(".", 1)[-1].split("?")[0]  # strip query string from ext
+    ext = logo_url.lower().rsplit(".", 1)[-1]
     if ext not in ("png", "jpg", "jpeg", "webp"):
         return None
     try:
         img = requests.get(logo_url, timeout=10)
         img.raise_for_status()
         h = wp_headers()
-        # Use the decoded filename for the Content-Disposition header
-        raw_filename = logo_url.split("/")[-1].split("?")[0]
-        filename     = unquote(raw_filename)
-        h["Content-Disposition"] = f"attachment; filename={filename}"
+        h["Content-Disposition"] = f"attachment; filename={logo_url.split('/')[-1]}"
         h["Content-Type"]        = img.headers.get("content-type", "image/jpeg")
         r = requests.post(
             WP_MEDIA_URL, headers=h, data=img.content,
@@ -1351,7 +1164,7 @@ def upload_logo(logo_url: str) -> Optional[int]:
         r.raise_for_status()
         return r.json().get("id")
     except Exception as e:
-        log.error(f"Logo upload error ({logo_url}): {e}")
+        log.error(f"Logo upload error: {e}")
         return None
 
 
@@ -1431,7 +1244,7 @@ def post_job_to_wp(job: dict, title: str, description: str) -> tuple:
 
     # Pre-seed common job types
     for jt_label in ["Full Time", "Part Time", "Contract",
-                      "Temporary", "Freelance", "Internship", "Volunteer"]:
+                     "Temporary", "Freelance", "Internship", "Volunteer"]:
         get_or_create_term(f"{WP_BASE}/job_listing_type", jt_label)
 
     location    = sanitize_text(job.get("location", "Uganda"))
@@ -1531,15 +1344,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Scrape GreatUgandaJobs → Paraphrase → Post to WordPress"
     )
-    parser.add_argument("--pages",         type=int, default=None,
+    parser.add_argument("--pages",        type=int, default=None,
                         help="Max listing pages (default: all)")
-    parser.add_argument("--output",        default="jobs",
+    parser.add_argument("--output",       default="jobs",
                         help="Output filename without extension (default: jobs)")
-    parser.add_argument("--json",          action="store_true",
+    parser.add_argument("--json",         action="store_true",
                         help="Also save JSON output")
     parser.add_argument("--no-paraphrase", action="store_true",
                         help="Skip Mistral paraphrasing (post raw text)")
-    parser.add_argument("--no-post",       action="store_true",
+    parser.add_argument("--no-post",      action="store_true",
                         help="Skip WordPress posting (scrape + save only)")
     args = parser.parse_args()
 
@@ -1550,7 +1363,7 @@ def main():
 
     if not args.no_post and MISTRAL_API_KEY == "YOUR_MISTRAL_API_KEY_HERE":
         log.warning("⚠️  MISTRAL_API_KEY not set — paraphrasing will fail.")
-    if not args.no_post and not WP_SITE_URL:
+    if not args.no_post and WP_SITE_URL == "https://yoursite.com":
         log.warning("⚠️  WP_SITE_URL not configured — WordPress posting will fail.")
 
     # ── Step 1: collect URLs ──────────────────────────────────
@@ -1564,9 +1377,9 @@ def main():
     processed_ids, processed_urls = load_processed_ids()
 
     # ── Step 2: scrape, paraphrase, post ─────────────────────
-    jobs        = []
-    errors      = 0
-    posted      = 0
+    jobs   = []
+    errors = 0
+    posted = 0
     skipped_dup = 0
 
     for i, url in enumerate(job_urls, 1):
