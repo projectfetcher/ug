@@ -214,7 +214,7 @@ def sanitize_text(text, is_url=False, is_email=False) -> str:
         return ""
     text = _fix_mojibake(text)
     if is_url or is_email:
-        return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
+        return re.sub(r"\s+", "", text)
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"\*\*", "", text)
     text = re.sub(
@@ -691,11 +691,11 @@ def scrape_job(url: str) -> Optional[dict]:
     logo_el = soup.find("img", class_="js_jobs_company_logo")
     company_logo = ""
     if logo_el:
-        raw_src = (
+        raw_src = re.sub(r"\s+", "", (
             logo_el.get("src") or
             logo_el.get("data-src") or
             logo_el.get("data-lazy-src") or ""
-        ).strip()
+        ))
         if raw_src.startswith("//"):
             company_logo = "https:" + raw_src
         elif raw_src.startswith("/"):
