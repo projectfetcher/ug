@@ -552,9 +552,8 @@ def extract_description(soup: BeautifulSoup) -> str:
     if not container:
         return ""
 
-    # Work on a copy so we don't mutate the original parse tree
-    import copy
-    container = copy.copy(container)
+    # Mutate in place — soup is already a fresh parse per job call,
+    # and scrape_job() extracts all other fields before calling this.
     _strip_description_noise(container)
 
     lines = []
@@ -778,6 +777,8 @@ def scrape_job(url: str) -> Optional[dict]:
     if not job_title:
         return None
 
+    # sd() helper — reads itemprop nodes from the ORIGINAL soup.
+    # Must be used BEFORE extract_description(), which mutates the soup.
     def sd(itemprop: str) -> str:
         el = soup.find(attrs={"itemprop": itemprop})
         return clean_text(el.get_text(" ", strip=True)) if el else ""
@@ -790,8 +791,8 @@ def scrape_job(url: str) -> Optional[dict]:
     raw_exp        = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
     experience     = clean_experience(raw_exp)
 
-    raw_loc  = extract_info_field(soup, "Duty Station") or sd("addressLocality")
-    location = clean_location(raw_loc)
+    raw_loc   = extract_info_field(soup, "Duty Station") or sd("addressLocality")
+    location  = clean_location(raw_loc)
     raw_field = extract_info_field(soup, "Job Category") or sd("occupationalCategory")
     field     = clean_field(raw_field)
 
@@ -826,10 +827,7 @@ def scrape_job(url: str) -> Optional[dict]:
                 if val.lower() not in ("not disclosed", "n/a", ""):
                     salary = val
 
-    # ── Description (cleaned) ─────────────────────────────────
-    job_description = extract_description(soup)
-
-    # ── Application link / email ──────────────────────────────
+    # ── Application link / email (read BEFORE description mutates soup) ──
     application = ""
     for a in soup.find_all("a", href=True):
         txt  = a.get_text(strip=True).lower()
@@ -842,18 +840,12 @@ def scrape_job(url: str) -> Optional[dict]:
                 application = href
                 break
     if not application:
-        m = re.search(
-            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", job_description
-        )
-        if m:
-            application = m.group(0)
-    if not application:
         for a in soup.find_all("a", href=True):
             if "application-email" in a["href"]:
                 application = clean_application(a["href"])
                 break
 
-    # ── Company info ──────────────────────────────────────────
+    # ── Company info (read BEFORE description mutates soup) ──────────────
     comp_anchor      = soup.find("a", class_="js_job_company_anchor")
     company_name     = ""
     company_page_url = ""
@@ -867,7 +859,7 @@ def scrape_job(url: str) -> Optional[dict]:
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    # ── Logo — extract, clean, and properly encode the URL ────
+    # ── Logo (read BEFORE description mutates soup) ───────────────────────
     logo_el      = soup.find("img", class_="js_jobs_company_logo")
     company_logo = ""
     if logo_el:
@@ -881,15 +873,24 @@ def scrape_job(url: str) -> Optional[dict]:
             raw_src = "https:" + raw_src
         elif raw_src.startswith("/"):
             raw_src = BASE_URL + raw_src
-        # Properly encode the URL (handles spaces in CDN filenames)
         company_logo = normalize_logo_url(raw_src)
-        # Discard placeholder / blank images
         if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image", "defaultlogo")):
             company_logo = ""
 
     website_el      = soup.find("div", itemprop="url")
     company_website = clean_text(website_el.get_text(strip=True)) if website_el else ""
     industry        = clean_text(sd("industry"))
+
+    # ── Description — called LAST because it mutates the soup ─────────────
+    job_description = extract_description(soup)
+
+    # Fall back to scanning description text for email if not found above
+    if not application:
+        m = re.search(
+            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", job_description
+        )
+        if m:
+            application = m.group(0)
 
     company_extra = {}
     if company_page_url:
