@@ -426,13 +426,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     if not container:
         return ""
 
-    # FIX 1: Remove schema.org microdata wrapper divs that bleed into description
-    # (timestamps, logo URLs, location codes, salary blocks, work hours, etc.)
-    for tag_name in ["div", "span"]:
-        for el in container.find_all(tag_name, itemprop=True):
-            if el.get("itemprop") not in ("description", "responsibilities"):
-                el.decompose()
-
     lines = []
 
     def walk(el):
@@ -461,8 +454,7 @@ def extract_description(soup: BeautifulSoup) -> str:
                 walk(child)
         elif tag is None:
             text = str(el).strip()
-            # FIX 2: Skip bare URLs (logo/company links leaking into description)
-            if text and not re.match(r'https?://', text):
+            if text:
                 lines.append(text)
         else:
             for child in el.children:
@@ -696,10 +688,6 @@ def scrape_job(url: str) -> Optional[dict]:
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    # FIX 3: Filter out greatugandajobs.com fallback URLs from company_url
-    if company_page_url and "greatugandajobs.com" in company_page_url:
-        company_page_url = ""
-
     logo_el = soup.find("img", class_="js_jobs_company_logo")
     company_logo = ""
     if logo_el:
@@ -716,17 +704,9 @@ def scrape_job(url: str) -> Optional[dict]:
             company_logo = raw_src
         if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image")):
             company_logo = ""
-        # FIX 4: Decode %20 and other URL-encoded characters in logo URL
-        if company_logo:
-            company_logo = unquote(company_logo)
 
     website_el      = soup.find("div", itemprop="url")
     company_website = clean_text(website_el.get_text(strip=True)) if website_el else ""
-
-    # FIX 3 (continued): Filter out greatugandajobs.com fallback from website
-    if company_website and "greatugandajobs.com" in company_website:
-        company_website = ""
-
     industry        = clean_text(sd("industry"))
 
     company_extra = {}
