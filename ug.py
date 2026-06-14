@@ -464,7 +464,7 @@ def _strip_description_preamble(text: str) -> str:
         # Pure digit line  e.g. "8" (work hours) or "120" (experience months)
         if re.match(r"^\d+$", s):
             continue
-        # Country-only lines that slip through e.g. "Uganda"
+        # Country-only lines that slip through
         if s.lower() in ("uganda", "kenya", "nigeria", "rwanda", "tanzania"):
             continue
         clean.append(line)
@@ -499,64 +499,6 @@ def _strip_description_preamble(text: str) -> str:
 
     return result_text
 
-
-def extract_description(soup: BeautifulSoup) -> str:
-    container = (
-        soup.find("div", class_="jsjobs_description_data") or
-        soup.find("div", itemprop="description")
-    )
-    if not container:
-        return ""
-
-    lines = []
-
-    def walk(el):
-        tag = el.name if el.name else None
-        if tag in ("script", "style", "noscript"):
-            return
-        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            text = el.get_text(" ", strip=True)
-            if text:
-                lines.append("")
-                lines.append(text.upper())
-                lines.append("")
-        elif tag == "li":
-            text = el.get_text(" ", strip=True)
-            if text:
-                lines.append(f"  • {text}")
-        elif tag == "p":
-            text = el.get_text(" ", strip=True)
-            if text:
-                lines.append(text)
-                lines.append("")
-        elif tag == "br":
-            lines.append("")
-        elif tag in ("ul", "ol", "div", "section", "article", "aside"):
-            for child in el.children:
-                walk(child)
-        elif tag is None:
-            text = str(el).strip()
-            if text:
-                lines.append(text)
-        else:
-            for child in el.children:
-                walk(child)
-
-    for child in container.children:
-        walk(child)
-
-    result, blank_count = [], 0
-    for line in lines:
-        if line == "":
-            blank_count += 1
-            if blank_count <= 1:
-                result.append("")
-        else:
-            blank_count = 0
-            result.append(line)
-
-    raw = "\n".join(result).strip()
-    return _strip_description_preamble(raw)
 
 def extract_description(soup: BeautifulSoup) -> str:
     container = (
@@ -755,13 +697,13 @@ def scrape_job(url: str) -> Optional[dict]:
         el = soup.find(attrs={"itemprop": itemprop})
         return clean_text(el.get_text(" ", strip=True)) if el else ""
 
-    raw_type   = sd("employmentType") or extract_info_field(soup, "Job Type")
-    job_type   = clean_job_type(raw_type)
-    qual_el    = soup.find(attrs={"itemprop": "credentialCategory"})
+    raw_type       = sd("employmentType") or extract_info_field(soup, "Job Type")
+    job_type       = clean_job_type(raw_type)
+    qual_el        = soup.find(attrs={"itemprop": "credentialCategory"})
     qualifications = clean_text(qual_el.get_text(strip=True)) if qual_el else ""
-    exp_el     = soup.find(attrs={"itemprop": "monthsOfExperience"})
-    raw_exp    = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
-    experience = clean_experience(raw_exp)
+    exp_el         = soup.find(attrs={"itemprop": "monthsOfExperience"})
+    raw_exp        = clean_text(exp_el.get_text(strip=True)) if exp_el else ""
+    experience     = clean_experience(raw_exp)
 
     raw_loc  = extract_info_field(soup, "Duty Station") or sd("addressLocality")
     location = clean_location(raw_loc)
@@ -776,13 +718,23 @@ def scrape_job(url: str) -> Optional[dict]:
     deadline     = clean_deadline(raw_deadline)
     est_deadline = add_three_months(date_posted) if date_posted else ""
 
+    # ── Salary — only build string when an actual numeric value exists ────
     sal_val  = soup.find("div", itemprop="value")
     sal_unit = soup.find("div", itemprop="unitText")
+    cur_el   = soup.find("div", itemprop="currency")
     salary   = ""
-    if sal_val and sal_val.get_text(strip=True):
-        cur_el = soup.find("div", itemprop="currency")
-        cur    = cur_el.get_text(strip=True) if cur_el else ""
-        salary = f"{cur} {sal_val.get_text(strip=True)} / {sal_unit.get_text(strip=True) if sal_unit else 'month'}".strip()
+
+    sal_val_text  = sal_val.get_text(strip=True)  if sal_val  else ""
+    sal_unit_text = sal_unit.get_text(strip=True) if sal_unit else ""
+    cur_text      = cur_el.get_text(strip=True)   if cur_el   else ""
+
+    if sal_val_text and re.search(r"\d", sal_val_text):
+        parts = [cur_text, sal_val_text]
+        if sal_unit_text:
+            parts.append(f"/ {sal_unit_text.lower().capitalize()}")
+        salary = " ".join(p for p in parts if p).strip()
+
+    # Fallback: og:description "Base Salary:" line
     if not salary:
         og = soup.find("meta", property="og:description")
         if og:
@@ -828,7 +780,7 @@ def scrape_job(url: str) -> Optional[dict]:
         if org_name:
             company_name = clean_text(org_name.get_text(strip=True))
 
-    logo_el = soup.find("img", class_="js_jobs_company_logo")
+    logo_el      = soup.find("img", class_="js_jobs_company_logo")
     company_logo = ""
     if logo_el:
         raw_src = re.sub(r"\s+", "", (
@@ -842,7 +794,7 @@ def scrape_job(url: str) -> Optional[dict]:
             company_logo = BASE_URL + raw_src
         elif raw_src.startswith("http"):
             company_logo = raw_src
-        if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image")):
+        if any(x in company_logo for x in ("blank.gif", "placeholder", "no-image", "defaultlogo")):
             company_logo = ""
 
     website_el      = soup.find("div", itemprop="url")
@@ -878,8 +830,6 @@ def scrape_job(url: str) -> Optional[dict]:
         "estimated_deadline": est_deadline,
         "salary_range":       salary,
     }
-
-
 # ─────────────────────────────────────────────────────────────
 #  LISTING PAGE  —  collect job URLs
 # ─────────────────────────────────────────────────────────────
@@ -1288,28 +1238,34 @@ def upload_logo(logo_url: str) -> Optional[int]:
     logo_url = sanitize_text(logo_url, is_url=True)
     if not logo_url or not logo_url.startswith("http"):
         return None
-    
-    # Decode %20 and other percent-encoded characters before processing
+
     from urllib.parse import unquote
-    logo_url = unquote(logo_url)
-    
-    ext = logo_url.lower().rsplit(".", 1)[-1]
+    logo_url_decoded = unquote(logo_url)
+
+    ext = logo_url_decoded.lower().rsplit(".", 1)[-1]
     if ext not in ("png", "jpg", "jpeg", "webp"):
         return None
     try:
-        img = requests.get(logo_url, timeout=10)
+        img = requests.get(logo_url, timeout=10)  # fetch with original encoded URL
         img.raise_for_status()
+
+        # Sanitize filename: no spaces, safe chars only
+        raw_filename = logo_url_decoded.split("/")[-1]
+        safe_filename = re.sub(r"[^a-zA-Z0-9._-]", "-", raw_filename)
+
         h = wp_headers()
-        h["Content-Disposition"] = f"attachment; filename={logo_url.split('/')[-1]}"
+        h["Content-Disposition"] = f'attachment; filename="{safe_filename}"'
         h["Content-Type"]        = img.headers.get("content-type", "image/jpeg")
         r = requests.post(
             WP_MEDIA_URL, headers=h, data=img.content,
             auth=(WP_USERNAME, WP_APP_PASSWORD), timeout=15, verify=False,
         )
         r.raise_for_status()
-        return r.json().get("id")
+        media_id = r.json().get("id")
+        log.info(f"    → Logo uploaded: {safe_filename} → media ID {media_id}")
+        return media_id
     except Exception as e:
-        log.error(f"Logo upload error: {e}")
+        log.error(f"Logo upload error ({logo_url}): {e}")
         return None
 
 def get_or_create_term(taxonomy_url: str, name: str) -> Optional[int]:
