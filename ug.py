@@ -419,6 +419,9 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def _strip_description_preamble(text: str) -> str:
+    """
+    Remove ATS metadata header/footer that bleeds into description on some jobs.
+    """
     CDN_PREFIXES = (
         "https://cdn.greatugandajobs.com",
         "https://www.greatugandajobs.com",
@@ -431,6 +434,36 @@ def _strip_description_preamble(text: str) -> str:
     CURRENCY_TOKENS = {"UGX", "USD", "KES", "EUR", "GBP"}
     PERIOD_TOKENS   = {"MONTH", "YEAR", "HOUR", "WEEK", "DAY"}
 
+    # ── Hard cut: everything from these markers onward is footer/metadata ──
+    HARD_CUT_PATTERNS = [
+        r"\n\s*Vacancy title\s*:",
+        r"\n\s*Work Hours\s*:",
+        r"\n\s*All Jobs\s*\|",
+        r"\n\s*Similar Jobs in",
+        r"\n\s*JOB DETAILS\s*:",
+        r"\n\s*More jobs in",
+        r"\n\s*Apply for this position",
+        r"\n\s*Job Overview",
+        r"\n\s*About the Employer",
+        r"\n\s*Save this job",
+        r"\n\s*Deadline\s*:",
+        r"\n\s*Job Type\s*\n",
+        r"\n\s*Experience Required",
+        r"\n\s*Qualifications?\s*\n",
+        r"\n\s*JOB-[a-f0-9]+",          # job ID token e.g. JOB-6a2c0ca0ba556
+        r"\n\s*View all jobs from",
+        r"\n\s*View original listing",
+        r"\n\s*Mimu.s Jobs",
+        r"\n\s*Uganda.s trusted job portal",
+        r"\n\s*Visit website",
+    ]
+
+    # Apply hard cuts first before line-by-line filtering
+    for pattern in HARD_CUT_PATTERNS:
+        m = re.search(pattern, text, re.I)
+        if m:
+            text = text[:m.start()].strip()
+
     lines = text.split("\n")
     clean = []
     for line in lines:
@@ -438,24 +471,39 @@ def _strip_description_preamble(text: str) -> str:
         if not s:
             clean.append("")
             continue
+        # ISO timestamp  e.g. 2026-05-28T13:14:31+00:00
         if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s):
             continue
+        # CDN or greatugandajobs URL
         if any(s.startswith(p) for p in CDN_PREFIXES):
             continue
+        # Any bare URL line
         if re.match(r"^https?://\S+$", s):
             continue
+        # Employment type token
         if s.upper() in TYPE_TOKENS:
             continue
+        # Currency or period token
         if s.upper() in CURRENCY_TOKENS or s.upper() in PERIOD_TOKENS:
             continue
+        # Postal code line  e.g. "00256"
         if re.match(r"^\d{5}$", s):
             continue
+        # Pure digit line  e.g. "8" (work hours) or "120" (months experience)
         if re.match(r"^\d+$", s):
             continue
-        if s.lower() in ("uganda", "kenya", "nigeria", "rwanda", "tanzania"):
+        # Single-word location/country lines
+        if s.lower() in (
+            "uganda", "kenya", "nigeria", "rwanda", "tanzania",
+            "kampala", "nairobi", "lagos", "kigali",
+        ):
+            continue
+        # Very short lines that are just leftover labels
+        if len(s) <= 3:
             continue
         clean.append(line)
 
+    # Collapse runs of blank lines
     result_lines, blanks = [], 0
     for line in clean:
         if line.strip() == "":
@@ -468,40 +516,29 @@ def _strip_description_preamble(text: str) -> str:
 
     result_text = "\n".join(result_lines).strip()
 
-    # Drop trailing metadata blocks
-    for marker_pattern in (
-        r"\n\s*Vacancy title\s*:",
-        r"\n\s*Work Hours\s*:",
-        r"\n\s*All Jobs\s*\|",
-        r"\n\s*Similar Jobs in",
-        r"\n\s*JOB DETAILS\s*:",
-        r"\n\s*More jobs in",
-    ):
-        m = re.search(marker_pattern, result_text, re.I)
-        if m:
-            result_text = result_text[:m.start()].strip()
-
-    # ── Deduplicate repeated paragraphs ──────────────────────────────────
-    # Split into paragraphs, keep only first occurrence of near-duplicate blocks
+    # ── Deduplicate repeated paragraph blocks ─────────────────────────────
+    # The page sometimes renders responsibilities 2-3 times in different divs.
+    # Compare normalized paragraphs and drop any with 75%+ word overlap
+    # with a paragraph already seen.
     paras = [p.strip() for p in re.split(r"\n{2,}", result_text) if p.strip()]
-    seen_paras, unique_paras = [], []
+    seen_normed, unique_paras = [], []
     for para in paras:
-        # Normalize for comparison: lowercase, collapse whitespace
         normed = re.sub(r"\s+", " ", para.lower().strip())
-        # Check if this paragraph is too similar to any already seen
+        words_para = set(normed.split())
+        if not words_para:
+            continue
         is_dup = False
-        for seen in seen_paras:
-            # Simple overlap check: if 80%+ of words match, treat as duplicate
-            words_para = set(normed.split())
+        for seen in seen_normed:
             words_seen = set(seen.split())
-            if not words_para:
+            if not words_seen:
                 continue
-            overlap = len(words_para & words_seen) / len(words_para)
-            if overlap >= 0.80:
+            # Overlap relative to the SMALLER paragraph to catch subset duplicates
+            overlap = len(words_para & words_seen) / min(len(words_para), len(words_seen))
+            if overlap >= 0.75:
                 is_dup = True
                 break
         if not is_dup:
-            seen_paras.append(normed)
+            seen_normed.append(normed)
             unique_paras.append(para)
 
     return "\n\n".join(unique_paras)
@@ -986,6 +1023,10 @@ def paraphrase_description(text: str) -> str:
     rewritten     = []
     success_count = 0
 
+    # ── Pre-filter: skip paragraphs too short to paraphrase ──────────────
+    # These are location lines, single labels etc. that slipped through
+    MIN_WORDS_TO_PARAPHRASE = 8
+
     print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
 
     for i, para in enumerate(paragraphs):
@@ -1002,13 +1043,23 @@ def paraphrase_description(text: str) -> str:
             print(f" │ │    {' '.join(orig_line)}")
         print(f" │ │ {'─'*60}")
 
+        # ── Skip very short paragraphs — keep original as-is ─────────────
+        if orig_wc < MIN_WORDS_TO_PARAPHRASE:
+            print(f" │ │ ⏭  SKIPPED — too short ({orig_wc} words, min={MIN_WORDS_TO_PARAPHRASE}), keeping original")
+            rewritten.append(para)
+            print(f" │ └{'─'*62}")
+            continue
+
         prompt = (
-            f"Rewrite this job description paragraph professionally using different words and sentence structure. "
-            f"Keep ALL specific facts, requirements, and responsibilities exactly as stated. "
+            f"Rewrite this job description paragraph professionally using different words and sentence structure.\n"
+            f"Keep ALL specific facts, job titles, company names, requirements, and responsibilities exactly as stated.\n"
             f"CRITICAL RULES:\n"
-            f"- Never use placeholder text like [X], [Job Title], [specific skill], [relevant field] or any text in square brackets\n"
-            f"- Never invent or omit any information\n"
-            f"- Output ONLY the rewritten paragraph — no labels, no explanation, no preamble\n\n"
+            f"- NEVER use placeholder text such as [X], [Job Title], [specific skill], [relevant field], "
+            f"[list 3-5 major duties], or ANY text inside square brackets\n"
+            f"- NEVER say 'I'm sorry' or respond conversationally — output ONLY the rewritten paragraph\n"
+            f"- NEVER invent information not present in the original\n"
+            f"- NEVER omit information that is present in the original\n"
+            f"- Output ONLY the rewritten paragraph — no labels, no preamble, no explanation\n\n"
             f"Original:\n{para}"
         )
 
@@ -1022,8 +1073,18 @@ def paraphrase_description(text: str) -> str:
             rw     = len(result.split()) if result else 0
             sim    = similarity_score(para, result) if result and rw >= 5 else 0.0
 
-            # ── NEW: reject any result containing bracket placeholders ──
-            has_placeholders = bool(re.search(r"\[[^\]]{1,60}\]", result))
+            # ── Rejection checks ─────────────────────────────────────────
+            has_placeholders   = bool(re.search(r"\[[^\]]{1,60}\]", result))
+            is_apology         = bool(re.match(
+                r"(i'?m sorry|i cannot|i can'?t|unfortunately|i apologize)", 
+                result.lower().strip()
+            ))
+            is_generic_filler  = bool(re.search(
+                r"(develop and implement strategies to enhance organizational|"
+                r"oversee daily operations to ensure alignment|"
+                r"foster a culture of continuous improvement)",
+                result, re.I
+            ))
 
             if result:
                 print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
@@ -1038,15 +1099,24 @@ def paraphrase_description(text: str) -> str:
             else:
                 print(f" │ │    Paraphrased : (no output from model)")
 
-            valid = bool(result) and rw >= 8 and sim >= 0.48 and not has_placeholders
+            valid = (
+                bool(result)
+                and rw >= 8
+                and sim >= 0.48
+                and not has_placeholders
+                and not is_apology
+                and not is_generic_filler
+            )
             if not valid:
                 reasons = []
-                if not result:          reasons.append("empty output")
-                if rw < 8:             reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48:         reasons.append(f"sim={sim:.3f} < 0.48")
-                if has_placeholders:   reasons.append("contains placeholder brackets [...]")
+                if not result:             reasons.append("empty output")
+                if rw < 8:                reasons.append(f"too short ({rw} words, min=8)")
+                if sim < 0.48:            reasons.append(f"sim={sim:.3f} < 0.48")
+                if has_placeholders:      reasons.append("contains placeholder brackets [...]")
+                if is_apology:            reasons.append("model responded with apology")
+                if is_generic_filler:     reasons.append("generic filler content detected")
                 print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim and not has_placeholders:
+                if result and sim > best_sim and not has_placeholders and not is_apology:
                     best_sim, best_result = sim, result
                     print(f" │ │       (stored as best fallback, sim={sim:.3f})")
             else:
