@@ -418,6 +418,88 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 #  DESCRIPTION EXTRACTOR
 # ─────────────────────────────────────────────────────────────
 
+def _strip_description_preamble(text: str) -> str:
+    """
+    Remove ATS metadata header/footer that bleeds into description on some jobs.
+    Strips ISO timestamps, CDN/site URLs, employment type tokens,
+    postal codes, currency codes, work-hours digits, and Vacancy title blocks.
+    """
+    CDN_PREFIXES = (
+        "https://cdn.greatugandajobs.com",
+        "https://www.greatugandajobs.com",
+    )
+    TYPE_TOKENS = {
+        "FULL_TIME", "PART_TIME", "CONTRACT", "CONTRACTOR",
+        "FULLTIME", "PARTTIME", "TEMPORARY", "INTERNSHIP",
+        "VOLUNTEER", "FREELANCE", "CASUAL",
+    }
+    CURRENCY_TOKENS = {"UGX", "USD", "KES", "EUR", "GBP"}
+    PERIOD_TOKENS   = {"MONTH", "YEAR", "HOUR", "WEEK", "DAY"}
+
+    lines = text.split("\n")
+    clean = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            clean.append("")
+            continue
+        # ISO timestamp  e.g. 2026-05-28T13:14:31+00:00
+        if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s):
+            continue
+        # CDN or site URL
+        if any(s.startswith(p) for p in CDN_PREFIXES):
+            continue
+        # Any other bare URL line starting with http
+        if re.match(r"^https?://\S+$", s):
+            continue
+        # Employment type token
+        if s.upper() in TYPE_TOKENS:
+            continue
+        # Currency or period token
+        if s.upper() in CURRENCY_TOKENS or s.upper() in PERIOD_TOKENS:
+            continue
+        # Postal code line  e.g. "00256"
+        if re.match(r"^\d{5}$", s):
+            continue
+        # Pure digit line  e.g. "8" (work hours) or "120" (experience months)
+        if re.match(r"^\d+$", s):
+            continue
+        # Country-only lines that slip through e.g. "Uganda"
+        if s.lower() in ("uganda", "kenya", "nigeria", "rwanda", "tanzania"):
+            continue
+        clean.append(line)
+
+    # Collapse runs of blank lines
+    result_lines, blanks = [], 0
+    for line in clean:
+        if line.strip() == "":
+            blanks += 1
+            if blanks <= 1:
+                result_lines.append("")
+        else:
+            blanks = 0
+            result_lines.append(line)
+
+    result_text = "\n".join(result_lines).strip()
+
+    # Drop trailing structured metadata block starting at "Vacancy title:"
+    vacancy_marker = re.search(r"\n\s*Vacancy title\s*:", result_text, re.I)
+    if vacancy_marker:
+        result_text = result_text[:vacancy_marker.start()].strip()
+
+    # Drop trailing "Work Hours:" block (alternate footer format)
+    work_hours_marker = re.search(r"\n\s*Work Hours\s*:", result_text, re.I)
+    if work_hours_marker:
+        result_text = result_text[:work_hours_marker.start()].strip()
+
+    # Drop trailing "All Jobs |" footer line
+    all_jobs_marker = re.search(r"\n\s*All Jobs\s*\|", result_text, re.I)
+    if all_jobs_marker:
+        result_text = result_text[:all_jobs_marker.start()].strip()
+
+    return result_text
+
+
 def extract_description(soup: BeautifulSoup) -> str:
     container = (
         soup.find("div", class_="jsjobs_description_data") or
@@ -473,8 +555,66 @@ def extract_description(soup: BeautifulSoup) -> str:
             blank_count = 0
             result.append(line)
 
-    return "\n".join(result).strip()
+    raw = "\n".join(result).strip()
+    return _strip_description_preamble(raw)
 
+def extract_description(soup: BeautifulSoup) -> str:
+    container = (
+        soup.find("div", class_="jsjobs_description_data") or
+        soup.find("div", itemprop="description")
+    )
+    if not container:
+        return ""
+
+    lines = []
+
+    def walk(el):
+        tag = el.name if el.name else None
+        if tag in ("script", "style", "noscript"):
+            return
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            text = el.get_text(" ", strip=True)
+            if text:
+                lines.append("")
+                lines.append(text.upper())
+                lines.append("")
+        elif tag == "li":
+            text = el.get_text(" ", strip=True)
+            if text:
+                lines.append(f"  • {text}")
+        elif tag == "p":
+            text = el.get_text(" ", strip=True)
+            if text:
+                lines.append(text)
+                lines.append("")
+        elif tag == "br":
+            lines.append("")
+        elif tag in ("ul", "ol", "div", "section", "article", "aside"):
+            for child in el.children:
+                walk(child)
+        elif tag is None:
+            text = str(el).strip()
+            if text:
+                lines.append(text)
+        else:
+            for child in el.children:
+                walk(child)
+
+    for child in container.children:
+        walk(child)
+
+    result, blank_count = [], 0
+    for line in lines:
+        if line == "":
+            blank_count += 1
+            if blank_count <= 1:
+                result.append("")
+        else:
+            blank_count = 0
+            result.append(line)
+
+    raw = "\n".join(result).strip()
+    return _strip_description_preamble(raw)
 
 # ─────────────────────────────────────────────────────────────
 #  VERBOSE PRINTER
@@ -1148,6 +1288,11 @@ def upload_logo(logo_url: str) -> Optional[int]:
     logo_url = sanitize_text(logo_url, is_url=True)
     if not logo_url or not logo_url.startswith("http"):
         return None
+    
+    # Decode %20 and other percent-encoded characters before processing
+    from urllib.parse import unquote
+    logo_url = unquote(logo_url)
+    
     ext = logo_url.lower().rsplit(".", 1)[-1]
     if ext not in ("png", "jpg", "jpeg", "webp"):
         return None
@@ -1166,7 +1311,6 @@ def upload_logo(logo_url: str) -> Optional[int]:
     except Exception as e:
         log.error(f"Logo upload error: {e}")
         return None
-
 
 def get_or_create_term(taxonomy_url: str, name: str) -> Optional[int]:
     if not name or not name.strip():
