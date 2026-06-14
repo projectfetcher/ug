@@ -61,9 +61,9 @@ MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_MODEL   = "mistral-small-latest"
 
 # ── WordPress ─────────────────────────────────────────────────
-WP_SITE_URL   = os.getenv("WP_SITE_URL",   "https://yoursite.com")
-WP_USERNAME   = os.getenv("WP_USERNAME",   "your_wp_username")
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "your_app_password")
+WP_SITE_URL   = os.getenv("WP_SITE_URL",   "")
+WP_USERNAME   = os.getenv("WP_USERNAME",   "")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 
 WP_BASE       = f"{WP_SITE_URL}/wp-json/wp/v2"
 WP_URL        = f"{WP_BASE}/job_listing"
