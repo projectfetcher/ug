@@ -419,11 +419,6 @@ def extract_info_field(soup: BeautifulSoup, label: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def _strip_description_preamble(text: str) -> str:
-    """
-    Remove ATS metadata header/footer that bleeds into description on some jobs.
-    Strips ISO timestamps, CDN/site URLs, employment type tokens,
-    postal codes, currency codes, work-hours digits, and Vacancy title blocks.
-    """
     CDN_PREFIXES = (
         "https://cdn.greatugandajobs.com",
         "https://www.greatugandajobs.com",
@@ -443,33 +438,24 @@ def _strip_description_preamble(text: str) -> str:
         if not s:
             clean.append("")
             continue
-        # ISO timestamp  e.g. 2026-05-28T13:14:31+00:00
         if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s):
             continue
-        # CDN or site URL
         if any(s.startswith(p) for p in CDN_PREFIXES):
             continue
-        # Any other bare URL line starting with http
         if re.match(r"^https?://\S+$", s):
             continue
-        # Employment type token
         if s.upper() in TYPE_TOKENS:
             continue
-        # Currency or period token
         if s.upper() in CURRENCY_TOKENS or s.upper() in PERIOD_TOKENS:
             continue
-        # Postal code line  e.g. "00256"
         if re.match(r"^\d{5}$", s):
             continue
-        # Pure digit line  e.g. "8" (work hours) or "120" (experience months)
         if re.match(r"^\d+$", s):
             continue
-        # Country-only lines that slip through
         if s.lower() in ("uganda", "kenya", "nigeria", "rwanda", "tanzania"):
             continue
         clean.append(line)
 
-    # Collapse runs of blank lines
     result_lines, blanks = [], 0
     for line in clean:
         if line.strip() == "":
@@ -482,22 +468,43 @@ def _strip_description_preamble(text: str) -> str:
 
     result_text = "\n".join(result_lines).strip()
 
-    # Drop trailing structured metadata block starting at "Vacancy title:"
-    vacancy_marker = re.search(r"\n\s*Vacancy title\s*:", result_text, re.I)
-    if vacancy_marker:
-        result_text = result_text[:vacancy_marker.start()].strip()
+    # Drop trailing metadata blocks
+    for marker_pattern in (
+        r"\n\s*Vacancy title\s*:",
+        r"\n\s*Work Hours\s*:",
+        r"\n\s*All Jobs\s*\|",
+        r"\n\s*Similar Jobs in",
+        r"\n\s*JOB DETAILS\s*:",
+        r"\n\s*More jobs in",
+    ):
+        m = re.search(marker_pattern, result_text, re.I)
+        if m:
+            result_text = result_text[:m.start()].strip()
 
-    # Drop trailing "Work Hours:" block (alternate footer format)
-    work_hours_marker = re.search(r"\n\s*Work Hours\s*:", result_text, re.I)
-    if work_hours_marker:
-        result_text = result_text[:work_hours_marker.start()].strip()
+    # ── Deduplicate repeated paragraphs ──────────────────────────────────
+    # Split into paragraphs, keep only first occurrence of near-duplicate blocks
+    paras = [p.strip() for p in re.split(r"\n{2,}", result_text) if p.strip()]
+    seen_paras, unique_paras = [], []
+    for para in paras:
+        # Normalize for comparison: lowercase, collapse whitespace
+        normed = re.sub(r"\s+", " ", para.lower().strip())
+        # Check if this paragraph is too similar to any already seen
+        is_dup = False
+        for seen in seen_paras:
+            # Simple overlap check: if 80%+ of words match, treat as duplicate
+            words_para = set(normed.split())
+            words_seen = set(seen.split())
+            if not words_para:
+                continue
+            overlap = len(words_para & words_seen) / len(words_para)
+            if overlap >= 0.80:
+                is_dup = True
+                break
+        if not is_dup:
+            seen_paras.append(normed)
+            unique_paras.append(para)
 
-    # Drop trailing "All Jobs |" footer line
-    all_jobs_marker = re.search(r"\n\s*All Jobs\s*\|", result_text, re.I)
-    if all_jobs_marker:
-        result_text = result_text[:all_jobs_marker.start()].strip()
-
-    return result_text
+    return "\n\n".join(unique_paras)
 
 
 def extract_description(soup: BeautifulSoup) -> str:
@@ -996,10 +1003,12 @@ def paraphrase_description(text: str) -> str:
         print(f" │ │ {'─'*60}")
 
         prompt = (
-            f"Rewrite this job description paragraph professionally. "
-            f"Keep ALL facts, requirements, and responsibilities. "
-            f"Use different sentence structure and vocabulary. "
-            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
+            f"Rewrite this job description paragraph professionally using different words and sentence structure. "
+            f"Keep ALL specific facts, requirements, and responsibilities exactly as stated. "
+            f"CRITICAL RULES:\n"
+            f"- Never use placeholder text like [X], [Job Title], [specific skill], [relevant field] or any text in square brackets\n"
+            f"- Never invent or omit any information\n"
+            f"- Output ONLY the rewritten paragraph — no labels, no explanation, no preamble\n\n"
             f"Original:\n{para}"
         )
 
@@ -1012,6 +1021,9 @@ def paraphrase_description(text: str) -> str:
             result = clean_output(raw).strip()
             rw     = len(result.split()) if result else 0
             sim    = similarity_score(para, result) if result and rw >= 5 else 0.0
+
+            # ── NEW: reject any result containing bracket placeholders ──
+            has_placeholders = bool(re.search(r"\[[^\]]{1,60}\]", result))
 
             if result:
                 print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
@@ -1026,14 +1038,15 @@ def paraphrase_description(text: str) -> str:
             else:
                 print(f" │ │    Paraphrased : (no output from model)")
 
-            valid = bool(result) and rw >= 8 and sim >= 0.48
+            valid = bool(result) and rw >= 8 and sim >= 0.48 and not has_placeholders
             if not valid:
                 reasons = []
-                if not result:  reasons.append("empty output")
-                if rw < 8:      reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48:  reasons.append(f"sim={sim:.3f} < 0.48")
+                if not result:          reasons.append("empty output")
+                if rw < 8:             reasons.append(f"too short ({rw} words, min=8)")
+                if sim < 0.48:         reasons.append(f"sim={sim:.3f} < 0.48")
+                if has_placeholders:   reasons.append("contains placeholder brackets [...]")
                 print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim:
+                if result and sim > best_sim and not has_placeholders:
                     best_sim, best_result = sim, result
                     print(f" │ │       (stored as best fallback, sim={sim:.3f})")
             else:
