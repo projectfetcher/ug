@@ -956,6 +956,8 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
 
 
 def paraphrase_title(title: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return title
     clean = sanitize_text(title)
     if not clean:
         return title
@@ -964,7 +966,8 @@ def paraphrase_title(title: str) -> str:
     print(f" │ Original : \"{clean}\"")
     print(f" │ {'─'*60}")
 
-    best_result, best_sim = None, 0.0
+    best_result = None
+    best_sim    = 0.0
 
     for attempt in range(4):
         temp = round(0.68 + attempt * 0.06, 2)
@@ -975,6 +978,7 @@ def paraphrase_title(title: str) -> str:
             f"Output ONLY the rewritten title, nothing else. "
             f"Keep it between 4 and 12 words.\n\nJob title: {clean}"
         )
+
         raw    = mistral_generate(prompt, max_tokens=50, temperature=temp)
         result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
 
@@ -986,6 +990,7 @@ def paraphrase_title(title: str) -> str:
         print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes ⚠️' if is_dup else 'No'}")
 
         valid = bool(result) and 4 <= wc <= 14 and sim >= 0.55 and not is_dup
+
         if not valid:
             reasons = []
             if not result:  reasons.append("empty output")
@@ -996,128 +1001,85 @@ def paraphrase_title(title: str) -> str:
             print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
         else:
             if sim > best_sim:
-                best_sim, best_result = sim, result
-                print(f" │    → ✅ ACCEPTED — new best (sim={sim:.3f})")
+                best_sim    = sim
+                best_result = result
+                print(f" │    → ✅ ACCEPTED — new best candidate (sim={sim:.3f})")
             else:
-                print(f" │    → ✅ VALID but not better (best sim={best_sim:.3f})")
+                print(f" │    → ✅ VALID but not better than current best (best sim={best_sim:.3f})")
 
         print(f" │ {'─'*60}")
         time.sleep(1)
 
     if best_result:
-        print(f" │ 🏆 FINAL: \"{best_result}\" (sim={best_sim:.3f})")
+        print(f" │ 🏆 FINAL SELECTED : \"{best_result}\"")
+        print(f" │    Similarity     : {best_sim:.3f}")
         print(f" └{'─'*65}")
         return best_result
     else:
-        print(f" │ ⚠️  No valid paraphrase → keeping original: \"{clean}\"")
+        print(f" │ ⚠️  No valid paraphrase found → Keeping original: \"{clean}\"")
         print(f" └{'─'*65}")
         return clean
 
-
 def paraphrase_description(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
     clean = sanitize_text(text)
     if not clean:
         return text
 
-    paragraphs    = [p.strip() for p in clean.split("\n") if p.strip()]
-    rewritten     = []
+    paragraphs  = [p.strip() for p in clean.split("\n") if p.strip()]
+    rewritten   = []
     success_count = 0
-
-    # ── Pre-filter: skip paragraphs too short to paraphrase ──────────────
-    # These are location lines, single labels etc. that slipped through
-    MIN_WORDS_TO_PARAPHRASE = 8
 
     print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
 
     for i, para in enumerate(paragraphs):
         orig_wc = len(para.split())
+
         print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
         print(f" │ │ ORIGINAL ({orig_wc} words):")
-        orig_line = []
-        for w in para.split():
-            orig_line.append(w)
-            if len(" ".join(orig_line)) >= 100:
-                print(f" │ │    {' '.join(orig_line)}")
-                orig_line = []
-        if orig_line:
-            print(f" │ │    {' '.join(orig_line)}")
+        _print_wrapped(para, prefix=" │ │    ")
         print(f" │ │ {'─'*60}")
 
-        # ── Skip very short paragraphs — keep original as-is ─────────────
-        if orig_wc < MIN_WORDS_TO_PARAPHRASE:
-            print(f" │ │ ⏭  SKIPPED — too short ({orig_wc} words, min={MIN_WORDS_TO_PARAPHRASE}), keeping original")
-            rewritten.append(para)
-            print(f" │ └{'─'*62}")
-            continue
-
         prompt = (
-            f"Rewrite this job description paragraph professionally using different words and sentence structure.\n"
-            f"Keep ALL specific facts, job titles, company names, requirements, and responsibilities exactly as stated.\n"
-            f"CRITICAL RULES:\n"
-            f"- NEVER use placeholder text such as [X], [Job Title], [specific skill], [relevant field], "
-            f"[list 3-5 major duties], or ANY text inside square brackets\n"
-            f"- NEVER say 'I'm sorry' or respond conversationally — output ONLY the rewritten paragraph\n"
-            f"- NEVER invent information not present in the original\n"
-            f"- NEVER omit information that is present in the original\n"
-            f"- Output ONLY the rewritten paragraph — no labels, no preamble, no explanation\n\n"
+            f"Rewrite this job description paragraph professionally. "
+            f"Keep ALL facts, requirements, and responsibilities. "
+            f"Use different sentence structure and vocabulary. "
+            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
             f"Original:\n{para}"
         )
 
-        best_result, best_sim, accepted_text = None, 0.0, None
+        best_result = None
+        best_sim    = 0.0
+        accepted_text = None
 
         for attempt in range(3):
-            temp   = round(0.65 + attempt * 0.08, 2)
+            temp = round(0.65 + attempt * 0.08, 2)
             print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
+
             raw    = mistral_generate(prompt, max_tokens=500, temperature=temp)
             result = clean_output(raw).strip()
-            rw     = len(result.split()) if result else 0
-            sim    = similarity_score(para, result) if result and rw >= 5 else 0.0
 
-            # ── Rejection checks ─────────────────────────────────────────
-            has_placeholders   = bool(re.search(r"\[[^\]]{1,60}\]", result))
-            is_apology         = bool(re.match(
-                r"(i'?m sorry|i cannot|i can'?t|unfortunately|i apologize)", 
-                result.lower().strip()
-            ))
-            is_generic_filler  = bool(re.search(
-                r"(develop and implement strategies to enhance organizational|"
-                r"oversee daily operations to ensure alignment|"
-                r"foster a culture of continuous improvement)",
-                result, re.I
-            ))
+            rw  = len(result.split()) if result else 0
+            sim = similarity_score(para, result) if result and rw >= 5 else 0.0
 
             if result:
                 print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
-                line = []
-                for w in result.split():
-                    line.append(w)
-                    if len(" ".join(line)) >= 100:
-                        print(f" │ │       {' '.join(line)}")
-                        line = []
-                if line:
-                    print(f" │ │       {' '.join(line)}")
+                _print_wrapped(result, prefix=" │ │       ")
             else:
                 print(f" │ │    Paraphrased : (no output from model)")
 
-            valid = (
-                bool(result)
-                and rw >= 8
-                and sim >= 0.48
-                and not has_placeholders
-                and not is_apology
-                and not is_generic_filler
-            )
+            valid = bool(result) and rw >= 8 and sim >= 0.48
+
             if not valid:
                 reasons = []
-                if not result:             reasons.append("empty output")
-                if rw < 8:                reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48:            reasons.append(f"sim={sim:.3f} < 0.48")
-                if has_placeholders:      reasons.append("contains placeholder brackets [...]")
-                if is_apology:            reasons.append("model responded with apology")
-                if is_generic_filler:     reasons.append("generic filler content detected")
+                if not result: reasons.append("empty output")
+                if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
+                if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
                 print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim and not has_placeholders and not is_apology:
-                    best_sim, best_result = sim, result
+                if result and sim > best_sim:
+                    best_sim    = sim
+                    best_result = result
                     print(f" │ │       (stored as best fallback, sim={sim:.3f})")
             else:
                 print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
@@ -1125,114 +1087,116 @@ def paraphrase_description(text: str) -> str:
                 success_count += 1
                 accepted_text = result
                 break
+
             print(f" │ │ {'─'*60}")
             time.sleep(1)
 
         if accepted_text is None:
             print(f" │ │ {'─'*60}")
             if best_result and best_sim >= 0.40:
-                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f})")
+                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
+                _print_wrapped(best_result, prefix=" │ │    ")
                 rewritten.append(best_result)
                 success_count += 1
             else:
-                print(f" │ │ ⚠️  KEPT ORIGINAL (best sim={best_sim:.3f}, threshold=0.40)")
+                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
                 rewritten.append(para)
+
         print(f" │ └{'─'*62}")
 
-    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs paraphrased")
+    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs successfully paraphrased")
     print(f" └{'─'*80}\n")
+
     return "\n\n".join(rewritten)
 
-
-def paraphrase_company(text: str) -> str:
+def paraphrase_description(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
     clean = sanitize_text(text)
     if not clean:
         return text
 
-    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
-    orig_wc = len(clean.split())
-    print(f" │ Original ({orig_wc} words):")
-    line = []
-    for w in clean.split():
-        line.append(w)
-        if len(" ".join(line)) >= 100:
-            print(f" │    {' '.join(line)}")
-            line = []
-    if line:
-        print(f" │    {' '.join(line)}")
-    print(f" │ {'─'*60}")
+    paragraphs  = [p.strip() for p in clean.split("\n") if p.strip()]
+    rewritten   = []
+    success_count = 0
 
-    prompt = (
-        f"Rewrite this company description professionally. "
-        f"Preserve all facts. Use different wording. "
-        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
-    )
-    raw    = mistral_generate(prompt, max_tokens=600, temperature=0.68)
-    result = clean_output(raw)
-    rw     = len(result.split()) if result else 0
-    sim    = similarity_score(clean, result) if result and rw >= 10 else 0.0
+    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
 
-    if result and rw >= 10:
-        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
-        line = []
-        for w in result.split():
-            line.append(w)
-            if len(" ".join(line)) >= 100:
-                print(f" │    {' '.join(line)}")
-                line = []
-        if line:
-            print(f" │    {' '.join(line)}")
-        print(f" │ → ✅ ACCEPTED")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return result
-    else:
-        reasons = []
-        if not result:  reasons.append("empty output")
-        if rw < 10:     reasons.append(f"too short ({rw} words, min=10)")
-        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return clean
+    for i, para in enumerate(paragraphs):
+        orig_wc = len(para.split())
 
+        print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
+        print(f" │ │ ORIGINAL ({orig_wc} words):")
+        _print_wrapped(para, prefix=" │ │    ")
+        print(f" │ │ {'─'*60}")
 
-def paraphrase_tagline(text: str) -> str:
-    clean = sanitize_text(text[:300])
-    if not clean:
-        return text
+        prompt = (
+            f"Rewrite this job description paragraph professionally. "
+            f"Keep ALL facts, requirements, and responsibilities. "
+            f"Use different sentence structure and vocabulary. "
+            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
+            f"Original:\n{para}"
+        )
 
-    print(f"\n ┌─ TAGLINE PARAPHRASE {'─'*43}")
-    print(f" │ Original : \"{clean}\"")
-    print(f" │ {'─'*60}")
+        best_result = None
+        best_sim    = 0.0
+        accepted_text = None
 
-    prompt = (
-        f"Rewrite this company tagline as a crisp, professional phrase. "
-        f"Output ONLY the rewritten tagline (5–12 words). No explanation.\n\n"
-        f"Original: {clean}"
-    )
-    raw    = mistral_generate(prompt, max_tokens=35, temperature=0.75)
-    result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
-    wc     = len(result.split()) if result else 0
-    sim    = similarity_score(clean, result) if result else 0.0
+        for attempt in range(3):
+            temp = round(0.65 + attempt * 0.08, 2)
+            print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
 
-    print(f" │ Paraphrased : \"{result}\"")
-    print(f" │ Words: {wc} | Similarity: {sim:.3f}")
+            raw    = mistral_generate(prompt, max_tokens=500, temperature=temp)
+            result = clean_output(raw).strip()
 
-    if result and 3 <= wc <= 15:
-        print(f" │ → ✅ ACCEPTED")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return result
-    else:
-        reasons = []
-        if not result:  reasons.append("empty output")
-        if wc < 3:      reasons.append(f"too short ({wc} words, min=3)")
-        if wc > 15:     reasons.append(f"too long ({wc} words, max=15)")
-        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return clean
+            rw  = len(result.split()) if result else 0
+            sim = similarity_score(para, result) if result and rw >= 5 else 0.0
 
+            if result:
+                print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
+                _print_wrapped(result, prefix=" │ │       ")
+            else:
+                print(f" │ │    Paraphrased : (no output from model)")
+
+            valid = bool(result) and rw >= 8 and sim >= 0.48
+
+            if not valid:
+                reasons = []
+                if not result: reasons.append("empty output")
+                if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
+                if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
+                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
+                if result and sim > best_sim:
+                    best_sim    = sim
+                    best_result = result
+                    print(f" │ │       (stored as best fallback, sim={sim:.3f})")
+            else:
+                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
+                rewritten.append(result)
+                success_count += 1
+                accepted_text = result
+                break
+
+            print(f" │ │ {'─'*60}")
+            time.sleep(1)
+
+        if accepted_text is None:
+            print(f" │ │ {'─'*60}")
+            if best_result and best_sim >= 0.40:
+                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
+                _print_wrapped(best_result, prefix=" │ │    ")
+                rewritten.append(best_result)
+                success_count += 1
+            else:
+                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
+                rewritten.append(para)
+
+        print(f" │ └{'─'*62}")
+
+    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs successfully paraphrased")
+    print(f" └{'─'*80}\n")
+
+    return "\n\n".join(rewritten)
 
 # ═══════════════════════════════════════════════════════════════
 #  DUPLICATE TRACKER
