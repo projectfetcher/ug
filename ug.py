@@ -40,6 +40,8 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "YOUR_MISTRAL_API_KEY_HERE")
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_MODEL   = "mistral-small-latest"
 
+ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
+
 # ── WordPress ─────────────────────────────────────────────────
 WP_SITE_URL   = os.getenv("WP_SITE_URL",   "")
 WP_USERNAME   = os.getenv("WP_USERNAME",   "")
@@ -955,6 +957,18 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
         return ""
 
 
+def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
+    words = text.split()
+    line  = []
+    for w in words:
+        line.append(w)
+        if len(" ".join(line)) >= width:
+            print(f"{prefix}{' '.join(line)}")
+            line = []
+    if line:
+        print(f"{prefix}{' '.join(line)}")
+
+
 def paraphrase_title(title: str) -> str:
     if not ENABLE_PARAPHRASE:
         return title
@@ -1020,94 +1034,6 @@ def paraphrase_title(title: str) -> str:
         print(f" └{'─'*65}")
         return clean
 
-def paraphrase_description(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text)
-    if not clean:
-        return text
-
-    paragraphs  = [p.strip() for p in clean.split("\n") if p.strip()]
-    rewritten   = []
-    success_count = 0
-
-    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
-
-    for i, para in enumerate(paragraphs):
-        orig_wc = len(para.split())
-
-        print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
-        print(f" │ │ ORIGINAL ({orig_wc} words):")
-        _print_wrapped(para, prefix=" │ │    ")
-        print(f" │ │ {'─'*60}")
-
-        prompt = (
-            f"Rewrite this job description paragraph professionally. "
-            f"Keep ALL facts, requirements, and responsibilities. "
-            f"Use different sentence structure and vocabulary. "
-            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
-            f"Original:\n{para}"
-        )
-
-        best_result = None
-        best_sim    = 0.0
-        accepted_text = None
-
-        for attempt in range(3):
-            temp = round(0.65 + attempt * 0.08, 2)
-            print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
-
-            raw    = mistral_generate(prompt, max_tokens=500, temperature=temp)
-            result = clean_output(raw).strip()
-
-            rw  = len(result.split()) if result else 0
-            sim = similarity_score(para, result) if result and rw >= 5 else 0.0
-
-            if result:
-                print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
-                _print_wrapped(result, prefix=" │ │       ")
-            else:
-                print(f" │ │    Paraphrased : (no output from model)")
-
-            valid = bool(result) and rw >= 8 and sim >= 0.48
-
-            if not valid:
-                reasons = []
-                if not result: reasons.append("empty output")
-                if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
-                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim:
-                    best_sim    = sim
-                    best_result = result
-                    print(f" │ │       (stored as best fallback, sim={sim:.3f})")
-            else:
-                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
-                rewritten.append(result)
-                success_count += 1
-                accepted_text = result
-                break
-
-            print(f" │ │ {'─'*60}")
-            time.sleep(1)
-
-        if accepted_text is None:
-            print(f" │ │ {'─'*60}")
-            if best_result and best_sim >= 0.40:
-                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
-                _print_wrapped(best_result, prefix=" │ │    ")
-                rewritten.append(best_result)
-                success_count += 1
-            else:
-                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
-                rewritten.append(para)
-
-        print(f" │ └{'─'*62}")
-
-    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs successfully paraphrased")
-    print(f" └{'─'*80}\n")
-
-    return "\n\n".join(rewritten)
 
 def paraphrase_description(text: str) -> str:
     if not ENABLE_PARAPHRASE:
@@ -1197,6 +1123,87 @@ def paraphrase_description(text: str) -> str:
     print(f" └{'─'*80}\n")
 
     return "\n\n".join(rewritten)
+
+
+def paraphrase_company(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
+    clean = sanitize_text(text)
+    if not clean:
+        return text
+
+    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
+    orig_wc = len(clean.split())
+    print(f" │ Original ({orig_wc} words):")
+    _print_wrapped(clean, prefix=" │    ")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company description professionally. "
+        f"Preserve all facts. Use different wording. "
+        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
+    )
+
+    raw    = mistral_generate(prompt, max_tokens=600, temperature=0.68)
+    result = clean_output(raw)
+    rw     = len(result.split()) if result else 0
+    sim    = similarity_score(clean, result) if result and rw >= 10 else 0.0
+
+    if result and rw >= 10:
+        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
+        _print_wrapped(result, prefix=" │    ")
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result: reasons.append("empty output")
+        if rw < 10:    reasons.append(f"too short ({rw} words, min=10)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
+
+
+def paraphrase_tagline(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
+    clean = sanitize_text(text[:300])
+    if not clean:
+        return text
+
+    print(f"\n ┌─ TAGLINE PARAPHRASE {'─'*43}")
+    print(f" │ Original : \"{clean}\"")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company tagline as a crisp, professional phrase. "
+        f"Output ONLY the rewritten tagline (5–12 words). No explanation.\n\n"
+        f"Original: {clean}"
+    )
+
+    raw    = mistral_generate(prompt, max_tokens=35, temperature=0.75)
+    result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
+    wc     = len(result.split()) if result else 0
+
+    print(f" │ Paraphrased : \"{result}\"")
+    print(f" │ Words: {wc}")
+
+    if result and 3 <= wc <= 15:
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result: reasons.append("empty output")
+        if wc < 3:     reasons.append(f"too short ({wc} words, min=3)")
+        if wc > 15:    reasons.append(f"too long ({wc} words, max=15)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
 
 # ═══════════════════════════════════════════════════════════════
 #  DUPLICATE TRACKER
@@ -1414,7 +1421,7 @@ def post_job_to_wp(job: dict, title: str, description: str) -> tuple:
     if not deadline:
         deadline = sanitize_text(job.get("estimated_deadline", ""))
 
-    is_email = bool(re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", application))
+    is_email = bool(re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", application))
     is_url_v = bool(re.match(r"^https?://[^\s]+$", application))
     if not (is_email or is_url_v):
         application = ""
@@ -1510,7 +1517,7 @@ def main():
 
     if not args.no_post and MISTRAL_API_KEY == "YOUR_MISTRAL_API_KEY_HERE":
         log.warning("⚠️  MISTRAL_API_KEY not set — paraphrasing will fail.")
-    if not args.no_post and WP_SITE_URL == "https://yoursite.com":
+    if not args.no_post and WP_SITE_URL == "":
         log.warning("⚠️  WP_SITE_URL not configured — WordPress posting will fail.")
 
     # ── Step 1: collect URLs ──────────────────────────────────
